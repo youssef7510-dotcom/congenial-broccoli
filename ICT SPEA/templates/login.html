@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Administrator sign in · AttendAI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-page" data-csrf="{{ csrf_token }}">
+  <main class="login-card">
+    <div class="brand-mark">A</div>
+    <p class="eyebrow">ATTENDANCE CONTROL</p>
+    <h1>Administrator sign in</h1>
+    <p class="muted">Manage people, devices, attendance and daily reports.</p>
+    <form id="login-form">
+      <label>Username<input name="username" autocomplete="username" required autofocus></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="button primary wide" type="submit">Sign in</button>
+      <p class="notice error hidden" id="login-error"></p>
+    </form>
+    <a class="subtle-link" href="/">Back to attendance station</a>
+  </main>
+  <script src="{{ url_for('static', filename='login.js') }}"></script>
+</body>
+</html>
