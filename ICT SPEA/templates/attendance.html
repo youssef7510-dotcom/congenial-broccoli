@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attendance station · AttendAI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="station-page" data-csrf="{{ csrf_token }}">
+  <header class="topbar">
+    <a class="brand" href="/"><span class="brand-mark small">A</span><span>Attend<span class="brand-accent">AI</span></span></a>
+    <div class="topbar-right"><span class="connection-dot" id="connection-dot"></span><span id="station-status">Checking device…</span><a class="admin-link" href="/admin">Admin</a></div>
+  </header>
+  <main class="station-shell">
+    <section class="station-intro">
+      <p class="eyebrow">WELCOME TO SCHOOL</p>
+      <h1>Attendance station</h1>
+      <p class="muted">Position your face in the frame. The camera will securely check your profile.</p>
+    </section>
+    <section id="pair-panel" class="panel pair-panel hidden">
+      <div class="panel-icon">⌁</div>
+      <h2>Connect this device</h2>
+      <p class="muted">Enter the one-time code provided by your administrator.</p>
+      <form id="pair-form" class="pair-form">
+        <input name="device_name" placeholder="Device name (e.g. Main entrance)" maxlength="100" aria-label="Device name">
+        <input name="code" placeholder="8-character code" maxlength="8" required aria-label="Device pairing code" autocomplete="one-time-code">
+        <button class="button primary" type="submit">Connect device</button>
+      </form>
+      <p class="notice error hidden" id="pair-error"></p>
+    </section>
+    <section id="station-panel" class="station-grid hidden">
+      <div class="camera-card panel">
+        <div class="camera-topline"><span class="live-pill"><i></i> LIVE CAMERA</span><span class="camera-hint">Keep your face centered</span></div>
+        <div class="camera-frame">
+          <video id="camera" autoplay playsinline muted></video>
+          <div class="face-guide"><span></span></div>
+          <div class="camera-overlay hidden" id="camera-overlay"><span class="spinner"></span><span id="camera-overlay-text">Starting camera…</span></div>
+        </div>
+        <div class="station-controls">
+          <button class="button secondary" id="camera-toggle" type="button">Start camera</button>
+        </div>
+        <p class="camera-error notice error hidden" id="camera-error"></p>
+      </div>
+      <div class="result-column">
+        <section class="panel result-card" id="result-card">
+          <div class="result-symbol" id="result-symbol">⌖</div>
+          <p class="eyebrow" id="result-eyebrow">READY TO SCAN</p>
+          <h2 id="result-title">Looking for a face</h2>
+          <p class="muted" id="result-copy">Recognition retries automatically while the camera is active.</p>
+          <div id="person-details" class="person-details hidden"></div>
+          <div id="result-notice" class="notice hidden"></div>
+        </section>
+        <section id="early-panel" class="panel early-panel hidden">
+          <div class="section-heading"><span class="section-icon">↗</span><div><h3 id="departure-heading">Departure</h3><p class="muted" id="leave-countdown">Checking arrival time…</p></div></div>
+          <button class="button primary wide" id="leave-early-trigger" type="button" disabled>Leave Early</button>
+          <form id="early-form" class="hidden">
+            <label>Early-leave code<input name="code" required maxlength="8" autocomplete="off"></label>
+            <label>Reason for leaving<textarea name="reason" required rows="3" maxlength="500" placeholder="Enter your reason"></textarea></label>
+            <button class="button primary wide" type="submit">Confirm early departure</button>
+          </form>
+        </section>
+        <button class="button secondary wide hidden" id="next-scan" type="button">Scan again</button>
+        <section id="add-person-panel" class="panel add-person-panel hidden">
+          <div class="section-heading"><span class="section-icon">＋</span><div><h3>Add Person</h3><p class="muted">We could not confirm your face profile.</p></div></div>
+          <form id="self-enroll-form">
+            <label>Person type<select name="kind" id="enroll-kind"><option value="student">Student</option><option value="teacher">Teacher</option></select></label>
+            <label>Full name<input name="name" required maxlength="100"></label>
+            <label id="self-student-number">Student ID / number<input name="student_number" maxlength="50" placeholder="e.g. 2026-1042"></label>
+            <label id="self-student-class">Class<select name="class_id" id="self-class-select" required></select></label>
+            <p id="self-student-note" class="help-text hidden">Student requests are reviewed by an administrator before the profile can be used.</p>
+            <p id="self-teacher-note" class="help-text hidden">Teacher requests need only a full name and face photos. An administrator must confirm the request.</p>
+            <p id="self-pose-status" class="help-text">Capture three photos in order: look straight ahead, turn your head left, then right. Keep one face in the frame.</p>
+            <button class="button outline wide" id="capture-self-pose" type="button">Capture center photo</button>
+            <div id="self-pose-preview" class="pose-thumbnails hidden"></div>
+            <button class="button secondary wide" type="submit">Submit enrollment</button>
+          </form>
+          <p class="notice hidden" id="enroll-notice"></p>
+        </section>
+        <p class="privacy-note">Face profiles are used only for attendance matching on this school system.</p>
+      </div>
+    </section>
+  </main>
+  <footer class="page-footer"><span>AttendAI · School attendance</span><span id="clock"></span></footer>
+  <script src="{{ url_for('static', filename='attendance.js') }}"></script>
+</body>
+</html>
