@@ -239,13 +239,13 @@ function renderRecognized(result) {
   leaveButton.disabled = result.remaining_seconds > 0;
   leaveButton.textContent = result.departure_action === "Check Out"
     ? "Check Out"
-    : "I want to leave early";
+    : "Leave Early";
+  const attendanceStatus = result.current_status.attendance || "Present";
   updateLeaveCountdown(
     result.remaining_seconds || 0,
     result.minimum_early_leave_minutes,
     attendanceStatus,
   );
-  const attendanceStatus = result.current_status.attendance;
   document.querySelector("#result-copy").textContent = result.first_arrival
     ? attendanceStatus === "Late"
       ? `You're marked late. Arrival recorded at ${result.current_status.arrival_time}.`
@@ -259,7 +259,7 @@ function updateLeaveCountdown(secondsRemaining, minimumMinutes = 30, attendanceS
   const update = () => {
     if (secondsRemaining <= 0) {
       leaveButton.disabled = false;
-      leaveButton.textContent = "I want to leave early";
+      leaveButton.textContent = "Leave Early";
       countdown.textContent = `You're already marked ${attendanceStatus.toLowerCase()}. The ${minimumMinutes}-minute wait is complete. Press the button and scan your face again to continue.`;
       if (countdownTimer) window.clearInterval(countdownTimer);
       countdownTimer = null;
