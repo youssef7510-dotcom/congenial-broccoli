@@ -249,7 +249,8 @@ class AttendanceSystemTests(unittest.TestCase):
         self.assertEqual(ended.status_code, 200, ended.get_data(as_text=True))
 
         report = self.client.get("/api/admin/report.xlsx?date=2026-04-15")
-        self.assertEqual(report.status_code, 200, report.get_data(as_text=True))
+        self.assertEqual(report.status_code, 200, f"Excel export failed with HTTP {report.status_code}")
+        self.assertIn("spreadsheetml", report.content_type)
         workbook = load_workbook(io.BytesIO(report.data), read_only=True)
         aisha = next(
             row for row in workbook["Grade 8"].iter_rows(min_row=2, values_only=True)
