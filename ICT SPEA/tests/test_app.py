@@ -5,7 +5,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,6 +28,16 @@ class AttendanceSystemTests(unittest.TestCase):
                     "minimum_early_leave_minutes": "30",
                 }
             )
+            db = system.get_db()
+            roster_start = datetime(2026, 4, 14, 7, 0).astimezone().isoformat()
+            db.execute(
+                "UPDATE people SET created_at=?, confirmed_at=? WHERE confirmed=1",
+                (roster_start, roster_start),
+            )
+            db.execute(
+                "UPDATE settings SET value='2026-04-15' WHERE key='roster_history_start_date'"
+            )
+            db.commit()
         system.app.config["TESTING"] = True
         self.client = system.app.test_client()
         self.original_clock = system.now_local
@@ -81,7 +91,7 @@ class AttendanceSystemTests(unittest.TestCase):
             ).fetchone()["code"]
             system.now_local = lambda: datetime(2026, 4, 15, 14, 30)
             early = system.ensure_attendance(
-                person_ids["Aisha Rahman"], "departure", early_code, "Medical appointment"
+                person_ids["Aisha Rahman"], "early_departure", early_code, "Medical appointment"
             )
             self.assertEqual(early["record"]["departure_status"], "Left Early")
             self.assertEqual(early["record"]["early_leave_reason"], "Medical appointment")
@@ -125,14 +135,32 @@ class AttendanceSystemTests(unittest.TestCase):
         station_csrf = self.csrf("/")
         pair = self.client.post(
             "/api/pair",
-            json={"code": code, "device_name": "Front door"},
+            json={"code": code, "device_name": "Front door", "client_id": "a" * 32},
             headers={"X-CSRFToken": station_csrf},
         )
         self.assertEqual(pair.status_code, 200)
         self.assertTrue(self.client.get("/api/attendance/state").get_json()["paired"])
+        reconnect_code = self.client.post(
+            "/api/admin/devices/code", json={}, headers={"X-CSRFToken": csrf}
+        ).get_json()["code"]
+        reconnect = self.client.post(
+            "/api/pair",
+            json={
+                "code": reconnect_code,
+                "device_name": "Front door",
+                "client_id": "a" * 32,
+            },
+            headers={"X-CSRFToken": station_csrf},
+        )
+        self.assertEqual(reconnect.status_code, 200)
+        with system.app.app_context():
+            self.assertEqual(
+                system.get_db().execute("SELECT COUNT(*) FROM devices").fetchone()[0],
+                1,
+            )
         replay = self.client.post(
             "/api/pair",
-            json={"code": code, "device_name": "Second browser"},
+            json={"code": reconnect_code, "device_name": "Second browser"},
             headers={"X-CSRFToken": station_csrf},
         )
         self.assertEqual(replay.status_code, 400)
@@ -252,6 +280,33 @@ class AttendanceSystemTests(unittest.TestCase):
                 "08:00",
             )
 
+    def test_overnight_attendance_after_midnight_uses_shift_start_date(self):
+        with system.app.app_context():
+            system.set_settings(
+                {
+                    "attendance_start": "20:00",
+                    "attendance_cutoff": "20:15",
+                    "leaving_time": "02:00",
+                    "flexibility_minutes": "5",
+                }
+            )
+            person_id = system.get_db().execute(
+                "SELECT id FROM people WHERE kind='student' ORDER BY id LIMIT 1"
+            ).fetchone()["id"]
+            system.now_local = lambda: datetime(2026, 4, 15, 20, 0)
+            arrival = system.ensure_attendance(person_id, "arrival")
+            self.assertEqual(arrival["record"]["attendance_date"], "2026-04-15")
+            system.now_local = lambda: datetime(2026, 4, 16, 2, 0)
+            departure = system.ensure_attendance(person_id, "departure")
+            self.assertEqual(departure["record"]["attendance_date"], "2026-04-15")
+            self.assertEqual(departure["record"]["departure_time"], "02:00:00")
+            self.assertIsNone(
+                system.get_db().execute(
+                    "SELECT id FROM attendance WHERE person_id=? AND attendance_date='2026-04-16'",
+                    (person_id,),
+                ).fetchone()
+            )
+
     def test_first_complete_schedule_activates_today_and_unconfigured_days_block_attendance(self):
         test_date = datetime(2026, 4, 15, 8, 0)
         with system.app.app_context():
@@ -366,6 +421,54 @@ class AttendanceSystemTests(unittest.TestCase):
             self.assertIsNotNone(model)
             self.assertIn(response.get_json()["person_id"], labels.values())
 
+    def test_side_pose_detection_matches_the_requested_camera_direction(self):
+        gray = system.np.tile(
+            system.np.arange(200, dtype=system.np.uint8),
+            (200, 1),
+        )
+        image = system.cv2.cvtColor(gray, system.cv2.COLOR_GRAY2BGR)
+        detected_profile = system.np.array([[10, 20, 70, 80]], dtype=system.np.int32)
+
+        class LeftProfileCascade:
+            def __init__(self, _path):
+                self.calls = 0
+
+            def detectMultiScale(self, _image, **_kwargs):
+                self.calls += 1
+                return (
+                    detected_profile
+                    if self.calls == 2
+                    else system.np.empty((0, 4), dtype=system.np.int32)
+                )
+
+        with patch.object(system.cv2, "CascadeClassifier", LeftProfileCascade):
+            left_face, _ = system.extract_face(image, "left")
+        self.assertAlmostEqual(
+            float(left_face.mean()),
+            float(system.cv2.equalizeHist(gray[20:100, 120:190]).mean()),
+            delta=1,
+        )
+
+        class RightProfileCascade:
+            def __init__(self, _path):
+                self.calls = 0
+
+            def detectMultiScale(self, _image, **_kwargs):
+                self.calls += 1
+                return (
+                    detected_profile
+                    if self.calls == 1
+                    else system.np.empty((0, 4), dtype=system.np.int32)
+                )
+
+        with patch.object(system.cv2, "CascadeClassifier", RightProfileCascade):
+            right_face, _ = system.extract_face(image, "right")
+        self.assertAlmostEqual(
+            float(right_face.mean()),
+            float(system.cv2.equalizeHist(gray[20:100, 10:80]).mean()),
+            delta=1,
+        )
+
     def test_only_admins_manage_classes_and_assigned_class_is_archived(self):
         unauthenticated_csrf = self.csrf("/")
         response = self.client.post(
@@ -467,6 +570,7 @@ class AttendanceSystemTests(unittest.TestCase):
 
     def test_end_day_export_contains_class_and_teacher_sheets(self):
         csrf = self.sign_in()
+        system.now_local = lambda: datetime(2026, 4, 15, 16, 0)
         response = self.client.post(
             "/api/admin/end-day",
             json={"date": "2026-04-15"},
@@ -693,6 +797,15 @@ class AttendanceSystemTests(unittest.TestCase):
             self.assertEqual(final_scan.get_json()["final_status"], "Left Early")
 
     def test_early_ticket_cannot_fall_through_to_regular_checkout_at_boundary(self):
+        system.now_local = lambda: datetime(2026, 4, 15, 7, 59, 0)
+        with system.app.app_context():
+            system.set_settings(
+                {
+                    "attendance_cutoff": "08:00",
+                    "leaving_time": "08:01",
+                    "minimum_early_leave_minutes": "0",
+                }
+            )
         admin_csrf = self.sign_in()
         code = self.client.post(
             "/api/admin/devices/code",
@@ -708,7 +821,7 @@ class AttendanceSystemTests(unittest.TestCase):
         with system.app.app_context():
             system.set_settings(
                 {
-                    "attendance_cutoff": "08:15",
+                    "attendance_cutoff": "08:00",
                     "leaving_time": "08:01",
                     "minimum_early_leave_minutes": "0",
                 }
@@ -732,12 +845,18 @@ class AttendanceSystemTests(unittest.TestCase):
             patch.object(system, "extract_face", return_value=(image, b"face")),
             patch.object(system, "recognition_model", return_value=(FakeRecognizer(), {0: person_id})),
         ):
-            arrival = self.client.post(
+            arrival_response = self.client.post(
                 "/api/recognize",
                 json={"image": "frame"},
                 headers={"X-CSRFToken": station_csrf},
-            ).get_json()
-            self.assertTrue(arrival["first_arrival"])
+            )
+            self.assertEqual(
+                arrival_response.status_code,
+                200,
+                arrival_response.get_data(as_text=True),
+            )
+            arrival = arrival_response.get_json()
+            self.assertTrue(arrival.get("first_arrival"), arrival)
             self.assertTrue(arrival["early_available"])
             self.assertEqual(arrival["early_leave_closes_in_seconds"], 60)
             self.assertIsNone(arrival["ticket"])
@@ -775,8 +894,22 @@ class AttendanceSystemTests(unittest.TestCase):
                 json={"image": "frame"},
                 headers={"X-CSRFToken": station_csrf},
             ).get_json()
-            self.assertTrue(regular_scan["already_departed"])
-            self.assertEqual(regular_scan["final_status"], "Left")
+            self.assertFalse(regular_scan["already_departed"])
+            self.assertIsNone(regular_scan["final_status"])
+            with system.app.app_context():
+                attendance = system.get_db().execute(
+                    "SELECT departure_time, departure_status FROM attendance WHERE person_id=?",
+                    (person_id,),
+                ).fetchone()
+            self.assertIsNone(attendance["departure_time"])
+            self.assertIsNone(attendance["departure_status"])
+            checkout = self.client.post(
+                "/api/recognize",
+                json={"image": "frame", "confirm_checkout": True},
+                headers={"X-CSRFToken": station_csrf},
+            ).get_json()
+            self.assertTrue(checkout["already_departed"])
+            self.assertEqual(checkout["final_status"], "Left")
 
     def test_simultaneous_early_leave_submissions_record_only_one_departure(self):
         admin_csrf = self.sign_in()
@@ -795,7 +928,7 @@ class AttendanceSystemTests(unittest.TestCase):
         with system.app.app_context():
             system.set_settings(
                 {
-                    "attendance_cutoff": "16:00",
+                    "attendance_cutoff": "15:45",
                     "leaving_time": "16:00",
                     "minimum_early_leave_minutes": "0",
                 }
@@ -944,7 +1077,7 @@ class AttendanceSystemTests(unittest.TestCase):
             system.now_local = lambda: datetime(2026, 4, 15, 8, 0, 0)
             system.ensure_attendance(person_id, "arrival")
             system.now_local = lambda: datetime(2026, 4, 15, 8, 29, 59)
-            early = system.ensure_attendance(person_id, "departure", "ABCD1234", "Test")
+            early = system.ensure_attendance(person_id, "early_departure", "ABCD1234", "Test")
             self.assertEqual(early["remaining_seconds"], 1)
             self.assertIn("30 minutes", early["error"])
         with system.app.app_context():
@@ -961,7 +1094,7 @@ class AttendanceSystemTests(unittest.TestCase):
                 {
                     "minimum_early_leave_minutes": "10",
                     "leaving_time": "16:00",
-                    "attendance_cutoff": "16:00",
+                    "attendance_cutoff": "14:45",
                 }
             )
             person_id = system.get_db().execute(
@@ -970,7 +1103,7 @@ class AttendanceSystemTests(unittest.TestCase):
             system.now_local = lambda: datetime(2026, 4, 15, 14, 30, 0)
             system.ensure_attendance(person_id, "arrival")
             system.now_local = lambda: datetime(2026, 4, 15, 14, 39, 59)
-            too_early = system.ensure_attendance(person_id, "departure")
+            too_early = system.ensure_attendance(person_id, "early_departure")
             self.assertEqual(too_early["remaining_seconds"], 1)
             self.assertIn("10 minutes", too_early["error"])
             system.now_local = lambda: datetime(2026, 4, 15, 14, 40, 0)
@@ -978,7 +1111,7 @@ class AttendanceSystemTests(unittest.TestCase):
                 "SELECT code FROM early_codes WHERE used_at IS NULL LIMIT 1"
             ).fetchone()["code"]
             departure = system.ensure_attendance(
-                person_id, "departure", code, "Configured minimum test"
+                person_id, "early_departure", code, "Configured minimum test"
             )
             self.assertEqual(departure["record"]["departure_status"], "Left Early")
             self.assertEqual(departure["record"]["arrival_time"], "14:30:00")
@@ -986,18 +1119,22 @@ class AttendanceSystemTests(unittest.TestCase):
     def test_normal_departure_is_not_delayed_by_early_departure_setting(self):
         with system.app.app_context():
             system.set_settings(
-                {"minimum_early_leave_minutes": "30", "attendance_cutoff": "16:00"}
+                {
+                    "minimum_early_leave_minutes": "30",
+                    "attendance_cutoff": "14:00",
+                    "leaving_time": "16:00",
+                }
             )
             person_id = system.get_db().execute(
                 "SELECT id FROM people WHERE kind='student' ORDER BY id LIMIT 1"
             ).fetchone()["id"]
-            system.now_local = lambda: datetime(2026, 4, 15, 14, 30, 0)
+            system.now_local = lambda: datetime(2026, 4, 15, 13, 30, 0)
             system.ensure_attendance(person_id, "arrival")
-            system.now_local = lambda: datetime(2026, 4, 15, 15, 0, 0)
+            system.now_local = lambda: datetime(2026, 4, 15, 16, 0, 0)
             departure = system.ensure_attendance(person_id, "departure")
         self.assertEqual(departure["record"]["departure_status"], "Left")
-        self.assertEqual(departure["record"]["arrival_time"], "14:30:00")
-        self.assertEqual(departure["record"]["departure_time"], "15:00:00")
+        self.assertEqual(departure["record"]["arrival_time"], "13:30:00")
+        self.assertEqual(departure["record"]["departure_time"], "16:00:00")
 
     def test_departure_flexibility_allows_normal_checkout_then_flags_late_departure(self):
         self.sign_in()
@@ -1092,8 +1229,8 @@ class AttendanceSystemTests(unittest.TestCase):
             self.assertEqual(in_grace["departure_action"], "Check Out")
             self.assertFalse(in_grace["late_departure"])
             self.assertGreater(in_grace["late_departure_remaining_seconds"], 0)
-            self.assertTrue(in_grace["already_departed"])
-            self.assertEqual(in_grace["final_status"], "Left")
+            self.assertFalse(in_grace["already_departed"])
+            self.assertIsNone(in_grace["final_status"])
 
         with system.app.app_context():
             late_person_id = system.get_db().execute(
@@ -1113,8 +1250,8 @@ class AttendanceSystemTests(unittest.TestCase):
                 headers={"X-CSRFToken": station_csrf},
             ).get_json()
         self.assertTrue(late["late_departure"])
-        self.assertEqual(late["final_status"], "Left Late")
-        self.assertTrue(late["already_departed"])
+        self.assertIsNone(late["final_status"])
+        self.assertFalse(late["already_departed"])
 
     def test_early_leave_minimum_setting_is_validated_and_persisted(self):
         csrf = self.sign_in()
@@ -1134,11 +1271,11 @@ class AttendanceSystemTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         invalid_schedule = self.client.post(
             "/api/admin/settings",
-            json={"attendance_start": "08:16"},
+            json={"attendance_cutoff": "16:30", "leaving_time": "16:30"},
             headers={"X-CSRFToken": csrf},
         )
         self.assertEqual(invalid_schedule.status_code, 400)
-        self.assertIn("at or before", invalid_schedule.get_json()["error"].lower())
+        self.assertIn("departure must be after", invalid_schedule.get_json()["error"].lower())
 
     def test_admin_can_replace_demo_password_with_a_stronger_password(self):
         csrf = self.sign_in()
@@ -1178,6 +1315,37 @@ class AttendanceSystemTests(unittest.TestCase):
         )
         self.assertEqual(new_login.status_code, 200)
 
+    def test_login_attempts_are_rate_limited_until_lockout_expires(self):
+        now = [datetime(2026, 4, 15, 8, 0)]
+        system.now_local = lambda: now[0]
+        csrf = self.csrf("/admin")
+        for attempt in range(system.LOGIN_FAILURE_LIMIT):
+            response = self.client.post(
+                "/api/admin/login",
+                json={"username": "admin", "password": f"wrong-{attempt}"},
+                headers={"X-CSRFToken": csrf},
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertGreater(int(response.headers["Retry-After"]), 0)
+        blocked_valid_login = self.client.post(
+            "/api/admin/login",
+            json={"username": "admin", "password": "admin123"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(blocked_valid_login.status_code, 429)
+        now[0] += system.LOGIN_LOCKOUT_DURATION + timedelta(seconds=1)
+        successful_login = self.client.post(
+            "/api/admin/login",
+            json={"username": "admin", "password": "admin123"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(successful_login.status_code, 200)
+        with system.app.app_context():
+            self.assertEqual(
+                system.get_db().execute("SELECT COUNT(*) FROM login_attempts").fetchone()[0],
+                0,
+            )
+
     def test_network_bind_is_blocked_while_demo_password_is_active(self):
         with self.assertRaisesRegex(RuntimeError, "demo admin password"):
             system.validate_host_credentials("0.0.0.0")
@@ -1210,7 +1378,7 @@ class AttendanceSystemTests(unittest.TestCase):
             system.get_db().commit()
             system.now_local = lambda: datetime(2026, 4, 15, 8, 15, 1)
             result = system.ensure_attendance(
-                person_id, "departure", expired_code, "Expired-code test"
+                person_id, "early_departure", expired_code, "Expired-code test"
             )
             self.assertIn("invalid", result["error"].lower())
             self.assertEqual(
@@ -1247,8 +1415,8 @@ class AttendanceSystemTests(unittest.TestCase):
             code = db.execute(
                 "SELECT code FROM early_codes WHERE used_at IS NULL ORDER BY id LIMIT 1"
             ).fetchone()["code"]
-            first = system.ensure_attendance(person_ids[0], "departure", code, "First use")
-            second = system.ensure_attendance(person_ids[1], "departure", code, "Replay")
+            first = system.ensure_attendance(person_ids[0], "early_departure", code, "First use")
+            second = system.ensure_attendance(person_ids[1], "early_departure", code, "Replay")
         self.assertEqual(first["record"]["departure_status"], "Left Early")
         self.assertIn("invalid", second["error"].lower())
 
@@ -1452,6 +1620,104 @@ class AttendanceSystemTests(unittest.TestCase):
             db.commit()
             reopened = system.ensure_attendance(person_id, "arrival")
         self.assertIn("finalized", reopened["error"])
+
+    def test_end_day_rejects_dates_before_reliable_roster_history(self):
+        csrf = self.sign_in()
+        with system.app.app_context():
+            system.get_db().execute(
+                "UPDATE settings SET value='2026-04-16' WHERE key='roster_history_start_date'"
+            )
+            system.get_db().commit()
+        system.now_local = lambda: datetime(2026, 4, 15, 16, 0)
+        response = self.client.post(
+            "/api/admin/end-day",
+            json={"date": "2026-04-15"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("predates reliable roster tracking", response.get_json()["error"])
+        with system.app.app_context():
+            self.assertIsNone(
+                system.get_db().execute(
+                    "SELECT 1 FROM attendance_days WHERE attendance_date='2026-04-15'"
+                ).fetchone()
+            )
+            system.get_db().execute(
+                "DELETE FROM settings WHERE key='roster_history_start_date'"
+            )
+            system.get_db().commit()
+        missing_history = self.client.post(
+            "/api/admin/end-day",
+            json={"date": "2026-04-15"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(missing_history.status_code, 409)
+        self.assertIn("history is unavailable", missing_history.get_json()["error"].lower())
+
+    def test_end_day_uses_roster_at_arrival_open_and_saved_schedule(self):
+        csrf = self.sign_in()
+        with system.app.app_context():
+            db = system.get_db()
+            students = db.execute(
+                "SELECT id, name FROM people WHERE kind='student' ORDER BY name"
+            ).fetchall()
+            late_confirmed_id = students[0]["id"]
+            already_deactivated_id = students[1]["id"]
+            db.execute(
+                "UPDATE people SET confirmed_at=? WHERE id=?",
+                (
+                    datetime(2026, 4, 15, 8, 0).astimezone().isoformat(),
+                    late_confirmed_id,
+                ),
+            )
+            db.execute(
+                "UPDATE people SET active=0, deactivated_at=? WHERE id=?",
+                (
+                    datetime(2026, 4, 15, 7, 50).astimezone().isoformat(),
+                    already_deactivated_id,
+                ),
+            )
+            db.commit()
+            system.get_active_schedule("2026-04-15")
+
+        system.now_local = lambda: datetime(2026, 4, 15, 16, 0)
+        response = self.client.post(
+            "/api/admin/end-day",
+            json={"date": "2026-04-15"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        with system.app.app_context():
+            db = system.get_db()
+            self.assertIsNone(
+                db.execute(
+                    "SELECT 1 FROM attendance WHERE person_id=? AND attendance_date='2026-04-15'",
+                    (late_confirmed_id,),
+                ).fetchone()
+            )
+            self.assertIsNone(
+                db.execute(
+                    "SELECT 1 FROM attendance WHERE person_id=? AND attendance_date='2026-04-15'",
+                    (already_deactivated_id,),
+                ).fetchone()
+            )
+            remaining_active = students[2]["id"]
+            absent = db.execute(
+                "SELECT attendance_status FROM attendance WHERE person_id=? AND attendance_date='2026-04-15'",
+                (remaining_active,),
+            ).fetchone()
+            self.assertEqual(absent["attendance_status"], "Absent")
+
+    def test_end_day_rejects_historical_date_without_schedule_snapshot(self):
+        csrf = self.sign_in()
+        system.now_local = lambda: datetime(2026, 4, 16, 16, 0)
+        response = self.client.post(
+            "/api/admin/end-day",
+            json={"date": "2026-04-15"},
+            headers={"X-CSRFToken": csrf},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("No saved schedule", response.get_json()["error"])
 
     def test_self_enrollment_creates_pending_student_request(self):
         admin_csrf = self.sign_in()

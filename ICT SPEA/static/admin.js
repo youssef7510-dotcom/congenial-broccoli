@@ -361,6 +361,13 @@ async function startAdminCamera() {
       document.querySelector("#admin-camera-start").textContent = "Start camera";
     }
   } catch (error) {
+    if (state.cameraStream) {
+      state.cameraStream.getTracks().forEach((track) => track.stop());
+      state.cameraStream = null;
+    }
+    document.querySelector("#admin-camera").srcObject = null;
+    document.querySelector("#admin-camera-placeholder").classList.remove("hidden");
+    document.querySelector("#admin-camera-start").textContent = "Start camera";
     message(error.name === "NotAllowedError" ? "Camera permission denied. Allow camera access in Chrome." : "Unable to start camera. Use localhost or HTTPS and check the camera.", "error");
   }
 }

@@ -18,6 +18,24 @@ const selfEnrollmentImages = {};
 const enrollmentPoseOrder = ["center", "left", "right"];
 let availableClasses = [];
 
+function getDeviceClientId() {
+  try {
+    let id = localStorage.getItem("attendai-device-id");
+    if (!id) {
+      id = [...crypto.getRandomValues(new Uint8Array(16))]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      localStorage.setItem("attendai-device-id", id);
+    }
+    return /^[a-f0-9]{32}$/.test(id) ? id : "";
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "SecurityError") return "";
+    throw error;
+  }
+}
+
+const deviceClientId = getDeviceClientId();
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -44,7 +62,12 @@ function setCameraStatus(text) {
 
 async function checkPairing() {
   try {
-    const state = await fetch("/api/attendance/state").then((response) => response.json());
+    const stateUrl = deviceClientId
+      ? `/api/attendance/state?client_id=${encodeURIComponent(deviceClientId)}`
+      : "/api/attendance/state";
+    const stateResponse = await fetch(stateUrl);
+    const state = await stateResponse.json();
+    if (!stateResponse.ok) throw new Error(state.error || "Unable to check this device.");
     selfEnrollmentAllowed = state.self_enrollment;
     document.querySelector('#enroll-kind option[value="student"]').disabled = !selfEnrollmentAllowed;
     if (!selfEnrollmentAllowed) document.querySelector("#enroll-kind").value = "teacher";
@@ -94,6 +117,7 @@ document.querySelector("#pair-form").addEventListener("submit", async (event) =>
   const error = document.querySelector("#pair-error");
   error.classList.add("hidden");
   const values = Object.fromEntries(new FormData(event.currentTarget));
+  if (deviceClientId) values.client_id = deviceClientId;
   try {
     await request("/api/pair", { method: "POST", body: JSON.stringify(values) });
     await checkPairing();
@@ -122,6 +146,8 @@ async function startCamera() {
     scanTimer = window.setInterval(scanFace, 2200);
     scanFace();
   } catch (error) {
+    stopCamera();
+    document.querySelector("#camera-toggle").textContent = "Start camera";
     cameraOverlay.classList.add("hidden");
     cameraError.textContent = error.name === "NotAllowedError"
       ? "Camera permission was denied. Allow camera access in Chrome’s address-bar settings, then try again."
@@ -139,9 +165,13 @@ function stopCamera() {
   video.srcObject = null;
 }
 
-document.querySelector("#camera-toggle").addEventListener("click", () => {
-  cameraStream ? stopCamera() : startCamera();
-  document.querySelector("#camera-toggle").textContent = cameraStream ? "Stop camera" : "Start camera";
+document.querySelector("#camera-toggle").addEventListener("click", async () => {
+  if (cameraStream) {
+    stopCamera();
+    document.querySelector("#camera-toggle").textContent = "Start camera";
+  } else {
+    await startCamera();
+  }
 });
 
 function captureFrame() {
@@ -153,7 +183,10 @@ function captureFrame() {
   return canvas.toDataURL("image/jpeg", 0.82);
 }
 
-async function scanFace({ confirmEarlyDeparture = false } = {}) {
+async function scanFace({
+  confirmEarlyDeparture = false,
+  confirmCheckout = false,
+} = {}) {
   if (busy || !cameraStream) return false;
   busy = true;
   let recognized = false;
@@ -164,6 +197,7 @@ async function scanFace({ confirmEarlyDeparture = false } = {}) {
       body: JSON.stringify({
         image: frame,
         confirm_early_departure: confirmEarlyDeparture,
+        confirm_checkout: confirmCheckout,
       }),
     });
     if (result.recognized) {
@@ -260,6 +294,8 @@ function renderRecognized(result) {
     document.querySelector("#leave-countdown").textContent = "Face confirmed. Enter the active code and reason to confirm your departure.";
     leaveButton.classList.add("hidden");
     earlyForm.classList.remove("hidden");
+    currentTicket = result.ticket;
+    startEarlyLeaveFormCountdown(result.early_leave_closes_in_seconds);
     return;
   }
   earlyForm.classList.add("hidden");
@@ -333,6 +369,35 @@ function updateLeaveCountdown(
   if (shouldStartTimer) countdownTimer = window.setInterval(update, 1000);
 }
 
+function startEarlyLeaveFormCountdown(secondsRemaining) {
+  let seconds = Math.max(0, Number(secondsRemaining) || 0);
+  const hasTimeRemaining = seconds > 0;
+  const form = document.querySelector("#early-form");
+  const leaveButton = document.querySelector("#leave-early-trigger");
+  const countdown = document.querySelector("#leave-countdown");
+  const update = () => {
+    if (seconds <= 0) {
+      if (countdownTimer) window.clearInterval(countdownTimer);
+      countdownTimer = null;
+      currentTicket = null;
+      form.classList.add("hidden");
+      leaveButton.classList.remove("hidden");
+      leaveButton.disabled = false;
+      leaveButton.dataset.action = "checkout";
+      leaveButton.textContent = "Check Out";
+      document.querySelector("#departure-heading").textContent = "Check Out";
+      countdown.textContent =
+        "The early-leave window has closed. Press Check Out and scan your face again to confirm regular departure.";
+      return;
+    }
+    countdown.textContent =
+      `The early-leave window closes in ${seconds} seconds. Submit the code and reason before it closes.`;
+    seconds -= 1;
+  };
+  update();
+  if (hasTimeRemaining) countdownTimer = window.setInterval(update, 1000);
+}
+
 function showUnknownFlow() {
   document.querySelector("#result-symbol").textContent = "?";
   document.querySelector("#result-symbol").classList.remove("success");
@@ -348,9 +413,11 @@ function showUnknownFlow() {
 }
 
 document.querySelector("#leave-early-trigger").addEventListener("click", async (event) => {
+  const checkout = event.currentTarget.dataset.action === "checkout";
   event.currentTarget.disabled = true;
   const recognized = await scanFace({
-    confirmEarlyDeparture: event.currentTarget.dataset.action !== "checkout",
+    confirmEarlyDeparture: !checkout,
+    confirmCheckout: checkout,
   });
   if (!recognized) event.currentTarget.disabled = false;
 });
@@ -382,6 +449,8 @@ document.querySelector("#early-form").addEventListener("submit", async (event) =
       body: JSON.stringify({ ...values, ticket: currentTicket }),
     });
     showNotice(result.message, "success");
+    if (countdownTimer) window.clearInterval(countdownTimer);
+    countdownTimer = null;
     const details = document.querySelector("#person-details");
     if (details.children.length >= 4) {
       details.children[3].textContent = `Departure: Left Early · ${result.record.departure_time}`;
@@ -392,6 +461,8 @@ document.querySelector("#early-form").addEventListener("submit", async (event) =
   } catch (error) {
     showNotice(error.message, "error");
     if (error.message.toLowerCase().includes("window closed")) {
+      if (countdownTimer) window.clearInterval(countdownTimer);
+      countdownTimer = null;
       currentTicket = null;
       document.querySelector("#early-form").classList.add("hidden");
       document.querySelector("#departure-heading").textContent = "Check Out";
@@ -403,6 +474,8 @@ document.querySelector("#early-form").addEventListener("submit", async (event) =
       leaveButton.dataset.action = "checkout";
       leaveButton.textContent = "Check Out";
     } else if (error.message.includes("Face verification expired")) {
+      if (countdownTimer) window.clearInterval(countdownTimer);
+      countdownTimer = null;
       currentTicket = null;
       document.querySelector("#early-form").classList.add("hidden");
       const leaveButton = document.querySelector("#leave-early-trigger");

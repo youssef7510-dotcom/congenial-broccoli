@@ -54,6 +54,10 @@ EARLY_CODE_POOL_SIZE = 5
 EARLY_CODE_REFRESH_INTERVAL_SECONDS = 30
 FACE_MODEL_CACHE = None
 FACE_MODEL_LOCK = threading.Lock()
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_WINDOW = timedelta(minutes=15)
+LOGIN_LOCKOUT_DURATION = timedelta(minutes=15)
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 
 def load_secret_key():
@@ -95,6 +99,8 @@ CREATE TABLE IF NOT EXISTS people (
     face_image BLOB,
     active INTEGER NOT NULL DEFAULT 1,
     confirmed INTEGER NOT NULL DEFAULT 1,
+    confirmed_at TEXT,
+    deactivated_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -150,6 +156,7 @@ CREATE TABLE IF NOT EXISTS devices (
     name TEXT NOT NULL,
     device_type TEXT NOT NULL DEFAULT 'Browser',
     token_hash TEXT NOT NULL UNIQUE,
+    client_id_hash TEXT,
     paired_at TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1
 );
@@ -177,6 +184,12 @@ CREATE TABLE IF NOT EXISTS face_tickets (
 );
 CREATE INDEX IF NOT EXISTS attendance_date_idx ON attendance(attendance_date);
 CREATE INDEX IF NOT EXISTS people_active_idx ON people(active, confirmed, kind);
+CREATE TABLE IF NOT EXISTS login_attempts (
+    address_hash TEXT PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL,
+    window_started_at REAL NOT NULL,
+    locked_until REAL
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -227,9 +240,21 @@ def init_db():
         db.execute("ALTER TABLE people ADD COLUMN student_number TEXT")
     if "class_id" not in people_columns:
         db.execute("ALTER TABLE people ADD COLUMN class_id INTEGER REFERENCES classes(id)")
+    for column in ("confirmed_at", "deactivated_at"):
+        if column not in people_columns:
+            db.execute(f"ALTER TABLE people ADD COLUMN {column} TEXT")
     db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS active_student_number_idx "
         "ON people(student_number) WHERE kind='student' AND active=1 AND student_number IS NOT NULL"
+    )
+    device_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(devices)").fetchall()
+    }
+    if "client_id_hash" not in device_columns:
+        db.execute("ALTER TABLE devices ADD COLUMN client_id_hash TEXT")
+    db.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS devices_client_id_hash_idx
+           ON devices(client_id_hash) WHERE client_id_hash IS NOT NULL"""
     )
     db.execute(
         """INSERT OR IGNORE INTO face_profiles(person_id, pose, face_image, created_at)
@@ -255,7 +280,7 @@ def init_db():
                group_name_snapshot=COALESCE(group_name_snapshot, (SELECT group_name FROM people WHERE id=attendance.person_id)),
                student_number_snapshot=COALESCE(student_number_snapshot, (SELECT student_number FROM people WHERE id=attendance.person_id))
            WHERE person_name_snapshot IS NULL OR person_kind_snapshot IS NULL
-              OR group_name_snapshot IS NULL"""
+              OR group_name_snapshot IS NULL OR student_number_snapshot IS NULL"""
     )
     db.execute(
         """INSERT OR IGNORE INTO attendance_days(attendance_date, finalized_at)
@@ -284,16 +309,34 @@ def init_db():
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
         DEFAULT_SETTINGS.items(),
     )
+    migration_day = (
+        now_local().date() + timedelta(days=1)
+    ).isoformat()
+    db.execute(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('roster_history_start_date', ?)",
+        (migration_day,),
+    )
+    db.execute(
+        """UPDATE people SET confirmed_at=?
+           WHERE confirmed=1 AND confirmed_at IS NULL""",
+        (stamp(),),
+    )
+    db.execute(
+        """UPDATE people SET deactivated_at=?
+           WHERE active=0 AND deactivated_at IS NULL""",
+        (stamp(),),
+    )
     if db.execute("SELECT COUNT(*) FROM people").fetchone()[0] == 0:
         now = stamp()
         db.executemany(
-            """INSERT INTO people(kind, name, group_name, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO people(
+                   kind, name, group_name, confirmed_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
             [
-                ("student", "Aisha Rahman", "Grade 8", now, now),
-                ("student", "Omar Hassan", "Grade 8", now, now),
-                ("student", "Maya Chen", "Grade 9", now, now),
-                ("teacher", "Mr. Daniel Lee", "Mathematics", now, now),
+                ("student", "Aisha Rahman", "Grade 8", now, now, now),
+                ("student", "Omar Hassan", "Grade 8", now, now, now),
+                ("student", "Maya Chen", "Grade 9", now, now, now),
+                ("teacher", "Mr. Daniel Lee", "Mathematics", now, now, now),
             ],
         )
     db.execute(
@@ -440,23 +483,34 @@ def extract_face(image, pose="center"):
         profile_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_profileface.xml"
         )
-        faces = profile_cascade.detectMultiScale(
+        direct_faces = profile_cascade.detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=4, minSize=(70, 70)
         )
-        if len(faces) == 0:
-            flipped = cv2.flip(gray, 1)
-            mirrored_faces = profile_cascade.detectMultiScale(
-                flipped, scaleFactor=1.1, minNeighbors=4, minSize=(70, 70)
+        mirrored_faces = profile_cascade.detectMultiScale(
+            cv2.flip(gray, 1), scaleFactor=1.1, minNeighbors=4, minSize=(70, 70)
+        )
+        if len(direct_faces) + len(mirrored_faces) > 1:
+            raise ValueError(
+                "Could not verify a single turned face. Keep only one face in view and turn farther to the requested side."
             )
-            if len(mirrored_faces) == 1:
-                x, y, width, height = mirrored_faces[0]
-                faces = np.asarray(
-                    [(gray.shape[1] - x - width, y, width, height)]
-                )
+        expected_faces = mirrored_faces if pose == "left" else direct_faces
+        if not len(expected_faces):
+            expected_direction = "left (right side of the image)" if pose == "left" else "right (left side of the image)"
+            raise ValueError(
+                f"The face is not turned to the requested {pose}. Turn your head to your {expected_direction}, use good lighting, and try again."
+            )
+        if pose == "left":
+            x, y, width, height = mirrored_faces[0]
+            faces = np.asarray(
+                [(gray.shape[1] - x - width, y, width, height)],
+                dtype=np.int32,
+            )
+        else:
+            faces = direct_faces
     else:
         raise ValueError("Choose a center, left, or right enrollment photo.")
     if len(faces) == 0:
-        prompt = "Look straight at the camera" if pose == "center" else f"Turn your head to the {pose}"
+        prompt = "Look straight at the camera" if pose == "center" else f"Turn your head to your {pose}"
         raise ValueError(f"No {pose} face was detected. {prompt}, use good lighting, and try again.")
     if len(faces) > 1:
         raise ValueError("More than one face is visible. Ensure only the person being enrolled is in view.")
@@ -588,19 +642,34 @@ def schedule_values(settings):
 
 
 def schedule_is_configured(schedule):
+    return schedule_validation_error(schedule) is None
+
+
+def schedule_validation_error(schedule):
     try:
-        for key in ("attendance_start", "attendance_cutoff", "leaving_time"):
-            parse_clock_time(schedule[key])
+        start = parse_clock_time(schedule["attendance_start"])
+        cutoff = parse_clock_time(schedule["attendance_cutoff"])
+        leaving = parse_clock_time(schedule["leaving_time"])
         flexibility = int(schedule["flexibility_minutes"])
         minimum = int(schedule["minimum_early_leave_minutes"])
-        return (
-            0 <= flexibility <= 180
-            and 0 <= minimum <= 1440
-            and parse_clock_time(schedule["attendance_start"])
-            <= parse_clock_time(schedule["attendance_cutoff"])
-        )
+        if not 0 <= flexibility <= 180:
+            return "Flexibility must be between 0 and 180 minutes."
+        if not 0 <= minimum <= 1440:
+            return "Minimum time before early departure must be between 0 and 1440 minutes."
+        start_minutes = start.hour * 60 + start.minute
+        cutoff_minutes = cutoff.hour * 60 + cutoff.minute
+        leaving_minutes = leaving.hour * 60 + leaving.minute
+        if cutoff_minutes < start_minutes:
+            cutoff_minutes += 24 * 60
+        while leaving_minutes < cutoff_minutes:
+            leaving_minutes += 24 * 60
+        if cutoff_minutes < start_minutes or leaving_minutes <= cutoff_minutes:
+            return "Departure must be after the attendance cut-off."
+        if leaving_minutes - start_minutes >= 24 * 60:
+            return "A school schedule must finish within 24 hours of its arrival time."
+        return None
     except (KeyError, TypeError, ValueError):
-        return False
+        return "Enter valid arrival, cut-off, and departure times."
 
 
 def get_active_schedule(attendance_date=None):
@@ -611,7 +680,12 @@ def get_active_schedule(attendance_date=None):
         (day,),
     ).fetchone()
     if row:
-        return {"date": day, "configured": True, **json.loads(row["schedule_json"])}
+        schedule = json.loads(row["schedule_json"])
+        return {
+            "date": day,
+            "configured": schedule_is_configured(schedule),
+            **schedule,
+        }
 
     pending = schedule_values(get_settings())
     if not schedule_is_configured(pending):
@@ -632,7 +706,76 @@ def get_active_schedule(attendance_date=None):
         "SELECT schedule_json FROM schedule_snapshots WHERE attendance_date=?",
         (day,),
     ).fetchone()
-    return {"date": day, "configured": True, **json.loads(row["schedule_json"])}
+    schedule = json.loads(row["schedule_json"])
+    return {
+        "date": day,
+        "configured": schedule_is_configured(schedule),
+        **schedule,
+    }
+
+
+def schedule_snapshot(attendance_date):
+    row = get_db().execute(
+        "SELECT schedule_json FROM schedule_snapshots WHERE attendance_date=?",
+        (attendance_date,),
+    ).fetchone()
+    if not row:
+        return {"date": attendance_date, "configured": False, **schedule_values(get_settings())}
+    schedule = json.loads(row["schedule_json"])
+    return {
+        "date": attendance_date,
+        "configured": schedule_is_configured(schedule),
+        **schedule,
+    }
+
+
+def schedule_offsets(schedule):
+    start = parse_clock_time(schedule["attendance_start"])
+    cutoff = parse_clock_time(schedule["attendance_cutoff"])
+    leaving = parse_clock_time(schedule["leaving_time"])
+    start_minutes = start.hour * 60 + start.minute
+    cutoff_minutes = cutoff.hour * 60 + cutoff.minute
+    leaving_minutes = leaving.hour * 60 + leaving.minute
+    if cutoff_minutes < start_minutes:
+        cutoff_minutes += 24 * 60
+    while leaving_minutes < cutoff_minutes:
+        leaving_minutes += 24 * 60
+    return start_minutes, cutoff_minutes, leaving_minutes
+
+
+def schedule_event_datetime(schedule, attendance_date, event, tzinfo=None):
+    offsets = dict(
+        zip(
+            ("attendance_start", "attendance_cutoff", "leaving_time"),
+            schedule_offsets(schedule),
+        )
+    )
+    start = datetime.combine(
+        date.fromisoformat(attendance_date),
+        parse_clock_time(schedule["attendance_start"]),
+    )
+    return (
+        start + timedelta(minutes=offsets[event] - offsets["attendance_start"])
+    ).replace(tzinfo=tzinfo)
+
+
+def attendance_schedule_context(now=None):
+    now = now or now_local()
+    today = now.date()
+    today_text = today.isoformat()
+    active = get_active_schedule(today_text)
+    previous_text = (today - timedelta(days=1)).isoformat()
+    previous = schedule_snapshot(previous_text)
+    if previous["configured"]:
+        _, _, previous_departure = schedule_offsets(previous)
+        if previous_departure >= 24 * 60:
+            next_schedule = active if active["configured"] else previous
+            today_start_at = schedule_event_datetime(
+                next_schedule, today_text, "attendance_start", now.tzinfo
+            ) - timedelta(minutes=int(next_schedule["flexibility_minutes"]))
+            if now < today_start_at:
+                return previous_text, previous
+    return today_text, active
 
 
 def schedule_status():
@@ -664,6 +807,16 @@ def parse_iso_date(value):
     return parsed if parsed.isoformat() == value else None
 
 
+def timestamp_value(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.timestamp()
+
+
 def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction_open=False):
     if event_mode in {"departure", "early_departure"} and not transaction_open:
         refresh_early_codes()
@@ -671,8 +824,7 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
         return {"error": "Unsupported attendance event."}
     db = get_db()
     now = now_local()
-    today = now.date().isoformat()
-    settings = get_active_schedule(today)
+    attendance_date, settings = attendance_schedule_context(now)
     if not settings["configured"]:
         return {
             "error": "The school schedule has not been configured. Please contact an administrator.",
@@ -683,14 +835,14 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
         db.execute("BEGIN IMMEDIATE")
     day = db.execute(
         "SELECT 1 FROM attendance_days WHERE attendance_date=?",
-        (today,),
+        (attendance_date,),
     ).fetchone()
     if day:
         db.rollback()
         return {"error": "The attendance day has been finalized. Ask an administrator to correct the record."}
     row = db.execute(
         "SELECT * FROM attendance WHERE person_id = ? AND attendance_date = ?",
-        (person_id, today),
+        (person_id, attendance_date),
     ).fetchone()
     if row and row["finalized"]:
         db.rollback()
@@ -698,9 +850,10 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
     if event_mode == "arrival":
         if row and row["arrival_time"]:
             db.rollback()
-            return {"message": "Arrival is already recorded for today.", "record": dict(row), "duplicate": True}
-        start = parse_clock_time(settings["attendance_start"])
-        start_at = datetime.combine(now.date(), start).replace(tzinfo=now.tzinfo)
+            return {"message": "Arrival is already recorded for this school day.", "record": dict(row), "duplicate": True}
+        start_at = schedule_event_datetime(
+            settings, attendance_date, "attendance_start", now.tzinfo
+        )
         arrival_opens_at = start_at - timedelta(minutes=int(settings["flexibility_minutes"]))
         if now < arrival_opens_at:
             db.rollback()
@@ -711,9 +864,10 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
                 ),
                 "attendance_not_open": True,
             }
-        cutoff = parse_clock_time(settings["attendance_cutoff"])
         grace = int(settings["flexibility_minutes"])
-        cutoff_at = datetime.combine(now.date(), cutoff).replace(tzinfo=now.tzinfo)
+        cutoff_at = schedule_event_datetime(
+            settings, attendance_date, "attendance_cutoff", now.tzinfo
+        )
         final_arrival_deadline = cutoff_at + timedelta(minutes=grace)
         if now > final_arrival_deadline:
             db.rollback()
@@ -740,18 +894,19 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
                    )
                    SELECT id, ?, ?, ?, name, kind, group_name, student_number
                    FROM people WHERE id=?""",
-                (today, status, clock, person_id),
+                (attendance_date, status, clock, person_id),
             )
         db.commit()
         saved = db.execute(
             "SELECT * FROM attendance WHERE person_id = ? AND attendance_date = ?",
-            (person_id, today),
+            (person_id, attendance_date),
         ).fetchone()
         return {"message": f"Arrival recorded: {status}.", "record": dict(saved), "duplicate": False}
 
     if not row or not row["arrival_time"]:
         db.rollback()
-        return {"error": "No arrival is recorded for today. Scan again to check in first."}
+        db.rollback()
+        return {"error": "No arrival is recorded for this school day. Scan again to check in first."}
     if row["departure_time"]:
         db.rollback()
         return {
@@ -761,10 +916,14 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
             "already_departed": True,
         }
     arrival_clock = parse_clock_time(row["arrival_time"])
-    arrival_datetime = datetime.combine(now.date(), arrival_clock).replace(tzinfo=now.tzinfo)
+    arrival_datetime = datetime.combine(
+        date.fromisoformat(attendance_date), arrival_clock
+    ).replace(tzinfo=now.tzinfo)
     elapsed_seconds = max(0, int((now - arrival_datetime).total_seconds()))
     leaving_time = parse_clock_time(settings["leaving_time"])
-    departure_at = datetime.combine(now.date(), leaving_time).replace(tzinfo=now.tzinfo)
+    departure_at = schedule_event_datetime(
+        settings, attendance_date, "leaving_time", now.tzinfo
+    )
     if event_mode == "early_departure" and now >= departure_at:
         db.rollback()
         return {
@@ -774,7 +933,7 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
             ),
             "early_departure_closed": True,
         }
-    if event_mode == "early_departure" or now < departure_at:
+    if event_mode == "early_departure":
         minimum_seconds = int(settings["minimum_early_leave_minutes"]) * 60
         remaining_seconds = max(0, minimum_seconds - elapsed_seconds)
         if remaining_seconds:
@@ -826,6 +985,15 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
         saved = db.execute("SELECT * FROM attendance WHERE id = ?", (row["id"],)).fetchone()
         return {"message": "Early departure recorded.", "record": dict(saved), "duplicate": False}
 
+    if now < departure_at:
+        db.rollback()
+        return {
+            "error": (
+                "Regular check-out opens at "
+                f"{departure_at.strftime('%H:%M')}."
+            ),
+            "checkout_not_open": True,
+        }
     grace_end = departure_at + timedelta(minutes=int(settings["flexibility_minutes"]))
     departure_status = "Left Late" if now > grace_end else "Left"
     db.execute(
@@ -839,7 +1007,7 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
     db.commit()
     saved = db.execute(
         "SELECT * FROM attendance WHERE person_id = ? AND attendance_date = ?",
-        (person_id, today),
+        (person_id, attendance_date),
     ).fetchone()
     message = (
         "Late departure recorded for administrator review."
@@ -958,16 +1126,100 @@ def admin_dashboard():
     return render_template("admin.html", csrf_token=csrf_value())
 
 
+def login_address_hash():
+    address = request.remote_addr or "unknown"
+    return hashlib.sha256(f"{app.secret_key}:{address}".encode()).hexdigest()
+
+
+def login_lockout_remaining(address_hash, now=None):
+    now = now or now_local().timestamp()
+    row = get_db().execute(
+        "SELECT locked_until FROM login_attempts WHERE address_hash=?",
+        (address_hash,),
+    ).fetchone()
+    locked_until = float(row["locked_until"]) if row and row["locked_until"] is not None else None
+    if locked_until is None or locked_until <= now:
+        return 0
+    return math.ceil(locked_until - now)
+
+
+def record_login_failure(address_hash, now=None):
+    now = now or now_local().timestamp()
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute(
+        """SELECT failed_attempts, window_started_at, locked_until
+           FROM login_attempts WHERE address_hash=?""",
+        (address_hash,),
+    ).fetchone()
+    window_start = float(row["window_started_at"]) if row else None
+    if (
+        window_start is None
+        or now - window_start >= LOGIN_FAILURE_WINDOW.total_seconds()
+    ):
+        failures = 1
+        window_start = now
+        locked_until = None
+    else:
+        existing_lockout = (
+            float(row["locked_until"])
+            if row["locked_until"] is not None
+            else None
+        )
+        if existing_lockout is not None and existing_lockout > now:
+            db.rollback()
+            return math.ceil(existing_lockout - now)
+        failures = row["failed_attempts"] + 1
+        locked_until = (
+            now + LOGIN_LOCKOUT_DURATION.total_seconds()
+            if failures >= LOGIN_FAILURE_LIMIT
+            else None
+        )
+    db.execute(
+        """INSERT INTO login_attempts(
+               address_hash, failed_attempts, window_started_at, locked_until
+           ) VALUES (?, ?, ?, ?)
+           ON CONFLICT(address_hash) DO UPDATE SET
+               failed_attempts=excluded.failed_attempts,
+               window_started_at=excluded.window_started_at,
+               locked_until=excluded.locked_until""",
+        (address_hash, failures, window_start, locked_until),
+    )
+    db.commit()
+    return math.ceil(locked_until - now) if locked_until else 0
+
+
 @app.post("/api/admin/login")
 def login_api():
+    address_hash = login_address_hash()
+    retry_after = login_lockout_remaining(address_hash)
+    if retry_after:
+        response, status = api_error(
+            "Too many sign-in attempts. Try again in 15 minutes.", 429
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response, status
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", ""))
     admin = get_db().execute(
         "SELECT id, password_hash FROM admins WHERE username = ?", (username,)
     ).fetchone()
-    if not admin or not check_password_hash(admin["password_hash"], password):
+    password_valid = check_password_hash(
+        admin["password_hash"] if admin else DUMMY_PASSWORD_HASH,
+        password,
+    )
+    if not admin or not password_valid:
+        retry_after = record_login_failure(address_hash)
+        if retry_after:
+            response, status = api_error(
+                "Too many sign-in attempts. Try again in 15 minutes.", 429
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            return response, status
         return api_error("The username or password is incorrect.", 401)
+    get_db().execute("DELETE FROM login_attempts WHERE address_hash=?", (address_hash,))
+    get_db().commit()
     session.clear()
     session["admin_id"] = admin["id"]
     csrf_value()
@@ -1190,9 +1442,7 @@ def save_settings_api():
     effective_settings.update({key: str(value) for key, value in values.items()})
     candidate_schedule = schedule_values(effective_settings)
     if schedule_changed and not schedule_is_configured(candidate_schedule):
-        return api_error(
-            "Enter valid arrival, cut-off, and departure times, with arrival at or before the cut-off."
-        )
+        return api_error(schedule_validation_error(candidate_schedule))
     for key in ("self_enrollment", "allow_unpaired_devices"):
         if key in values:
             values[key] = "1" if values[key] in (True, 1, "1", "true") else "0"
@@ -1264,8 +1514,8 @@ def create_person_api():
     now = stamp()
     cursor = db.execute(
         """INSERT INTO people(kind, name, group_name, student_number, class_id, face_image,
-           created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (kind, name, group_name, student_number, class_id, profiles["center"], now, now),
+           confirmed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (kind, name, group_name, student_number, class_id, profiles["center"], now, now, now),
     )
     save_face_profiles(db, cursor.lastrowid, profiles)
     db.commit()
@@ -1347,7 +1597,11 @@ def update_person_api(person_id):
 @admin_required
 def remove_person_api(person_id):
     db = get_db()
-    cursor = db.execute("UPDATE people SET active=0, updated_at=? WHERE id=?", (stamp(), person_id))
+    changed_at = stamp()
+    cursor = db.execute(
+        "UPDATE people SET active=0, deactivated_at=?, updated_at=? WHERE id=? AND active=1",
+        (changed_at, changed_at, person_id),
+    )
     db.commit()
     if not cursor.rowcount:
         return api_error("Person not found.", 404)
@@ -1360,8 +1614,9 @@ def remove_person_api(person_id):
 def confirm_teacher_api(person_id):
     db = get_db()
     cursor = db.execute(
-        "UPDATE people SET confirmed=1, updated_at=? WHERE id=? AND confirmed=0 AND active=1",
-        (stamp(), person_id),
+        """UPDATE people SET confirmed=1, confirmed_at=?, updated_at=?
+           WHERE id=? AND confirmed=0 AND active=1""",
+        (stamp(), stamp(), person_id),
     )
     db.commit()
     if not cursor.rowcount:
@@ -1393,6 +1648,10 @@ def pair_device_api():
     data = request.get_json(silent=True) or {}
     code = str(data.get("code", "")).strip().upper()
     name = str(data.get("device_name", "")).strip()[:100] or "Attendance browser"
+    client_id = str(data.get("client_id", ""))
+    if client_id and not re.fullmatch(r"[a-f0-9]{32}", client_id):
+        return api_error("This browser could not be identified. Refresh and try again.")
+    client_id_hash = hashlib.sha256(client_id.encode()).hexdigest() if client_id else None
     if not re.fullmatch(r"[A-Z0-9]{8}", code):
         return api_error("Enter the 8-character device code shown by the administrator.")
     db = get_db()
@@ -1406,10 +1665,25 @@ def pair_device_api():
         return api_error("That device code is invalid, expired, or already used.")
     db.execute("UPDATE device_codes SET used_at=? WHERE id=?", (stamp(), row["id"]))
     token = secrets.token_urlsafe(48)
-    db.execute(
-        "INSERT INTO devices(name, token_hash, paired_at) VALUES (?, ?, ?)",
-        (name, hashlib.sha256(token.encode()).hexdigest(), stamp()),
-    )
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    existing_device = None
+    if client_id_hash:
+        existing_device = db.execute(
+            "SELECT id FROM devices WHERE client_id_hash=?",
+            (client_id_hash,),
+        ).fetchone()
+    if existing_device:
+        db.execute(
+            """UPDATE devices SET name=?, token_hash=?, paired_at=?, active=1
+               WHERE id=?""",
+            (name, token_hash, stamp(), existing_device["id"]),
+        )
+    else:
+        db.execute(
+            """INSERT INTO devices(name, token_hash, client_id_hash, paired_at)
+               VALUES (?, ?, ?, ?)""",
+            (name, token_hash, client_id_hash, stamp()),
+        )
     db.commit()
     response = jsonify(ok=True)
     response.set_cookie(
@@ -1439,27 +1713,58 @@ def attendance_state_api():
     token = request.cookies.get(DEVICE_COOKIE, "")
     db = get_db()
     device = None
+    response_token = None
     if token:
         device = db.execute(
-            "SELECT id FROM devices WHERE token_hash=? AND active=1",
+            "SELECT id, active FROM devices WHERE token_hash=?",
             (hashlib.sha256(token.encode()).hexdigest(),),
         ).fetchone()
+        if device and not device["active"]:
+            device = None
+    client_id = request.args.get("client_id", "")
+    client_id_hash = (
+        hashlib.sha256(client_id.encode()).hexdigest()
+        if re.fullmatch(r"[a-f0-9]{32}", client_id)
+        else None
+    )
+    client_device = None
+    if not device and client_id_hash:
+        client_device = db.execute(
+            "SELECT id, active FROM devices WHERE client_id_hash=?",
+            (client_id_hash,),
+        ).fetchone()
+        if client_device and client_device["active"]:
+            response_token = secrets.token_urlsafe(48)
+            db.execute(
+                "UPDATE devices SET token_hash=?, paired_at=? WHERE id=?",
+                (
+                    hashlib.sha256(response_token.encode()).hexdigest(),
+                    stamp(),
+                    client_device["id"],
+                ),
+            )
+            db.commit()
+            device = client_device
     settings = get_settings()
-    active_schedule = get_active_schedule()
+    _attendance_date, active_schedule = attendance_schedule_context()
     classes = db.execute(
         "SELECT id, name FROM classes WHERE active=1 ORDER BY name COLLATE NOCASE"
     ).fetchall()
-    response_token = None
-    if not device and settings["allow_unpaired_devices"] == "1":
+    if (
+        not device
+        and not (client_device and not client_device["active"])
+        and settings["allow_unpaired_devices"] == "1"
+    ):
         db.execute("BEGIN IMMEDIATE")
         response_token = secrets.token_urlsafe(48)
         db.execute(
-            """INSERT INTO devices(name, device_type, token_hash, paired_at)
-               VALUES (?, ?, ?, ?)""",
+            """INSERT INTO devices(name, device_type, token_hash, client_id_hash, paired_at)
+               VALUES (?, ?, ?, ?, ?)""",
             (
                 "Automatically connected browser",
                 "No-code browser",
                 hashlib.sha256(response_token.encode()).hexdigest(),
+                client_id_hash,
                 stamp(),
             ),
         )
@@ -1518,7 +1823,7 @@ def recognize_api():
     if not person:
         return jsonify(recognized=False, error="That person is no longer active.")
     now = now_local()
-    settings = get_active_schedule(now.date().isoformat())
+    attendance_date, settings = attendance_schedule_context(now)
     if not settings["configured"]:
         return jsonify(
             recognized=True,
@@ -1534,7 +1839,7 @@ def recognize_api():
         )
     stored_row = get_db().execute(
         "SELECT departure_time, finalized FROM attendance WHERE person_id=? AND attendance_date=?",
-        (person_id, now.date().isoformat()),
+        (person_id, attendance_date),
     ).fetchone()
     if not stored_row or (not stored_row["departure_time"] and not stored_row["finalized"]):
         result = ensure_attendance(person_id, "arrival")
@@ -1557,12 +1862,14 @@ def recognize_api():
         result = {"duplicate": True}
     attendance_row = get_db().execute(
         """SELECT * FROM attendance WHERE person_id=? AND attendance_date=?""",
-        (person_id, now.date().isoformat()),
+        (person_id, attendance_date),
     ).fetchone()
     first_arrival = not result.get("duplicate", False)
     mode = "arrival" if first_arrival else "departure"
     leaving = parse_clock_time(settings["leaving_time"])
-    leaving_datetime = datetime.combine(now.date(), leaving).replace(tzinfo=now.tzinfo)
+    leaving_datetime = schedule_event_datetime(
+        settings, attendance_date, "leaving_time", now.tzinfo
+    )
     departure_grace_ends_at = leaving_datetime + timedelta(
         minutes=int(settings["flexibility_minutes"])
     )
@@ -1579,7 +1886,9 @@ def recognize_api():
     early_remaining_seconds = 0
     if attendance_row["arrival_time"]:
         arrival_clock = parse_clock_time(attendance_row["arrival_time"])
-        arrival_datetime = datetime.combine(now.date(), arrival_clock).replace(tzinfo=now.tzinfo)
+        arrival_datetime = datetime.combine(
+            date.fromisoformat(attendance_date), arrival_clock
+        ).replace(tzinfo=now.tzinfo)
         elapsed_seconds = max(0, int((now - arrival_datetime).total_seconds()))
         early_remaining_seconds = max(
             0,
@@ -1589,18 +1898,18 @@ def recognize_api():
         early_remaining_seconds = 0 if attendance_row["finalized"] else (
             int(settings["minimum_early_leave_minutes"]) * 60
         )
-    if (
-        not first_arrival
-        and not attendance_row["departure_time"]
-        and not attendance_row["finalized"]
-        and now >= leaving_datetime
-    ):
+    if data.get("confirm_checkout") is True:
+        if now < leaving_datetime:
+            return api_error(
+                f"Regular check-out opens at {leaving_datetime.strftime('%H:%M')}.",
+                409,
+            )
         result = ensure_attendance(person_id, "departure")
         if result.get("error"):
             return api_error(result["error"], 409)
         attendance_row = get_db().execute(
             "SELECT * FROM attendance WHERE person_id=? AND attendance_date=?",
-            (person_id, now.date().isoformat()),
+            (person_id, attendance_date),
         ).fetchone()
     early_available = (
         not attendance_row["departure_time"]
@@ -1659,7 +1968,7 @@ def early_leave_api():
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     db = get_db()
     refresh_early_codes()
-    if not get_active_schedule()["configured"]:
+    if not attendance_schedule_context()[1]["configured"]:
         return api_error(
             "The school schedule has not been configured. Please contact an administrator.",
             409,
@@ -1750,8 +2059,10 @@ def self_enroll_api():
         return api_error("A matching person already exists. Please ask an administrator for help.")
     now = stamp()
     cursor = db.execute(
-        """INSERT INTO people(kind, name, group_name, student_number, class_id, face_image,
-           confirmed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO people(
+               kind, name, group_name, student_number, class_id, face_image,
+               confirmed, confirmed_at, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
         (
             kind,
             name,
@@ -1874,13 +2185,68 @@ def end_day_api():
     if parsed_date > now_local().date():
         return api_error("A future school day cannot be finalized.")
     db = get_db()
+    history_start = db.execute(
+        "SELECT value FROM settings WHERE key='roster_history_start_date'"
+    ).fetchone()
+    if not history_start or not parse_iso_date(history_start["value"]):
+        return api_error(
+            "Reliable roster history is unavailable. Attendance was not finalized.",
+            409,
+        )
+    if target_date < history_start["value"]:
+        return api_error(
+            "This date predates reliable roster tracking. Review and finalize its records manually.",
+            409,
+        )
+    schedule = (
+        get_active_schedule(target_date)
+        if target_date == current_day()
+        else schedule_snapshot(target_date)
+    )
+    if not schedule["configured"]:
+        return api_error(
+            "No saved schedule exists for this historical date, so its attendance roster cannot be finalized safely.",
+            409,
+        )
+    arrival_opens_at = schedule_event_datetime(
+        schedule, target_date, "attendance_start", now_local().tzinfo
+    ) - timedelta(minutes=int(schedule["flexibility_minutes"]))
+    opening_timestamp = arrival_opens_at.timestamp()
     db.execute("BEGIN IMMEDIATE")
     db.execute(
         "INSERT OR IGNORE INTO attendance_days(attendance_date, finalized_at) VALUES (?, ?)",
         (target_date, stamp()),
     )
-    people = db.execute("SELECT id FROM people WHERE active=1 AND confirmed=1").fetchall()
+    db.execute(
+        "UPDATE attendance SET finalized=1 WHERE attendance_date=?",
+        (target_date,),
+    )
+    people = db.execute(
+        """SELECT id, active, confirmed, created_at, confirmed_at, deactivated_at
+           FROM people"""
+    ).fetchall()
     for person in people:
+        if not person["confirmed"]:
+            continue
+        created_at = timestamp_value(person["created_at"])
+        confirmed_at = timestamp_value(person["confirmed_at"])
+        deactivated_at = timestamp_value(person["deactivated_at"])
+        if (
+            created_at is None
+            or confirmed_at is None
+            or (not person["active"] and deactivated_at is None)
+        ):
+            db.rollback()
+            return api_error(
+                "Roster lifecycle history is incomplete. Attendance was not finalized.",
+                409,
+            )
+        if (
+            created_at > opening_timestamp
+            or confirmed_at > opening_timestamp
+            or (deactivated_at is not None and deactivated_at <= opening_timestamp)
+        ):
+            continue
         row = db.execute(
             "SELECT id FROM attendance WHERE person_id=? AND attendance_date=?",
             (person["id"], target_date),
@@ -1942,14 +2308,16 @@ def export_report_api():
 
     class_names = sorted({row["group_name"] for row in rows if row["kind"] == "student"})
     sheet_names = {}
+    used_sheet_names = {"teachers"}
     for group in class_names:
         safe_name = re.sub(r"[\[\]:*?/\\]", "-", group).strip("'")[:31] or "Students"
-        base, suffix, index = safe_name, 1, 1
-        while safe_name.lower() in {name.lower() for name in sheet_names.values()}:
+        base, index = safe_name, 1
+        while safe_name.lower() in used_sheet_names:
             suffix = f" ({index})"
             safe_name = base[: 31 - len(suffix)] + suffix
             index += 1
         sheet_names[group] = safe_name
+        used_sheet_names.add(safe_name.lower())
     if not class_names:
         sheet_names["Students"] = "Students"
     sheet_names["__teachers__"] = "Teachers"
