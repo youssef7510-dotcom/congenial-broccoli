@@ -79,6 +79,11 @@ textarea { resize: vertical; }
 .camera-hint { color: #96a4b1; font-size: .72rem; }
 .camera-frame { position: relative; overflow: hidden; width: 100%; aspect-ratio: 4 / 3; border-radius: 11px; background: #142638; }
 .camera-frame video { width: 100%; height: 100%; display: block; object-fit: cover; transform: scaleX(-1); }
+#face-overlay { position: absolute; inset: 0; z-index: 2; width: 100%; height: 100%; transform: scaleX(-1); pointer-events: none; }
+.face-detection-status { margin: 10px 2px 0; min-height: 1.3em; color: #718394; font-size: .76rem; line-height: 1.5; }
+.face-detection-status[data-state="ready"] { color: #278c6d; }
+.face-detection-status[data-state="multiple"] { color: #a96b1c; }
+.face-detection-status[data-state="waiting"] { color: #718394; }
 .face-guide { pointer-events: none; position: absolute; inset: 12% 22%; border: 1.5px solid #ffffff85; border-radius: 45% 45% 42% 42%; box-shadow: 0 0 0 999px #08182718; }
 .face-guide span { position: absolute; width: 9px; height: 9px; right: -4px; top: 50%; border-radius: 50%; background: #51d4a9; box-shadow: 0 0 15px #51d4a9; }
 .camera-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: #e4edf3; background: #0e2234bd; font-size: .84rem; }
