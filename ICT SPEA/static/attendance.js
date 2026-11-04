@@ -223,17 +223,21 @@ document.querySelector("#camera-toggle").addEventListener("click", async () => {
 });
 
 function captureFrame(detection) {
-  if (!video.videoWidth || !video.videoHeight) throw new Error("Camera is still starting. Please wait a moment.");
-  if (!detection || !detection.box) throw new Error("A single face must be detected before capturing.");
-  const box = detection.box, paddingX = box.width * 0.32, paddingY = box.height * 0.38;
-  const left = Math.max(0, Math.floor(box.x - paddingX)), top = Math.max(0, Math.floor(box.y - paddingY));
-  const right = Math.min(video.videoWidth, Math.ceil(box.x + box.width + paddingX));
-  const bottom = Math.min(video.videoHeight, Math.ceil(box.y + box.height + paddingY));
-  const cropWidth = right - left, cropHeight = bottom - top;
-  if (cropWidth < 40 || cropHeight < 40) throw new Error("The detected face is too small. Move closer to the camera.");
-  const scale = Math.min(1, 800 / Math.max(cropWidth, cropHeight));
-  canvas.width = Math.max(1, Math.round(cropWidth * scale)); canvas.height = Math.max(1, Math.round(cropHeight * scale));
-  canvas.getContext("2d").drawImage(video, left, top, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+  if (!video.videoWidth || !video.videoHeight) {
+    throw new Error("Camera is still starting. Please wait a moment.");
+  }
+  if (!detection || !detection.box) {
+    throw new Error("A single face must be detected before capturing.");
+  }
+
+  // Keep the full camera frame. The backend's Haar cascade performs its own
+  // face localization and expects the original scene, not an SSD face crop.
+  // Sending a tight crop here caused a second detector to search inside an
+  // already-cropped face and could make valid students fail recognition.
+  const scale = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
+  canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+  canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL("image/jpeg", 0.9);
 }
 
