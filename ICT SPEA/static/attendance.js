@@ -39,12 +39,63 @@ function getDeviceClientId() {
 
 const deviceClientId = getDeviceClientId();
 
+let faceApiLibraryPromise = null;
+
+async function loadFaceApiLibrary() {
+  if (window.faceapi) return;
+  if (!faceApiLibraryPromise) {
+    faceApiLibraryPromise = (async () => {
+      const sources = [
+        "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js",
+        "https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js",
+      ];
+      for (const source of sources) {
+        try {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement("script");
+            script.src = source;
+            script.async = true;
+            script.onload = resolve;
+            script.onerror = () => {
+              script.remove();
+              reject(new Error("Could not load " + source));
+            };
+            document.head.appendChild(script);
+          });
+          if (window.faceapi) return;
+        } catch (error) {
+          console.warn("Face detector CDN failed; trying the fallback.", error);
+        }
+      }
+      throw new Error("The face detector library could not load from either CDN. Check your connection or network restrictions, then reload.");
+    })().catch((error) => {
+      faceApiLibraryPromise = null;
+      throw error;
+    });
+  }
+  await faceApiLibraryPromise;
+}
+
 async function ensureFaceDetector() {
-  if (!window.faceapi) throw new Error("The face detector library did not load. Check your internet connection and reload this page.");
+  await loadFaceApiLibrary();
   if (!faceDetectorPromise) {
-    faceDetectorPromise = faceapi.nets.ssdMobilenetv1.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights").catch(() => {
+    faceDetectorPromise = (async () => {
+      const modelSources = [
+        "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights",
+        "https://unpkg.com/face-api.js@0.22.2/weights",
+      ];
+      for (const source of modelSources) {
+        try {
+          await faceapi.nets.ssdMobilenetv1.loadFromUri(source);
+          return;
+        } catch (error) {
+          console.warn("Face detection model source failed; trying the fallback.", error);
+        }
+      }
+      throw new Error("The face detection model could not load from either CDN. Check your connection or network restrictions, then reload.");
+    })().catch((error) => {
       faceDetectorPromise = null;
-      throw new Error("The face detection model could not load. Check your internet connection and reload the page.");
+      throw error;
     });
   }
   await faceDetectorPromise;
