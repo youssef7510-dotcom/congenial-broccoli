@@ -1,6 +1,9 @@
 const csrf = document.body.dataset.csrf;
 const video = document.querySelector("#camera");
 const canvas = document.createElement("canvas");
+const faceOverlay = document.querySelector("#face-overlay");
+const faceDetectionStatus = document.querySelector("#face-detection-status");
+let faceDetectorPromise = null;
 const pairPanel = document.querySelector("#pair-panel");
 const stationPanel = document.querySelector("#station-panel");
 const cameraOverlay = document.querySelector("#camera-overlay");
@@ -35,6 +38,46 @@ function getDeviceClientId() {
 }
 
 const deviceClientId = getDeviceClientId();
+
+async function ensureFaceDetector() {
+  if (!window.faceapi) throw new Error("The face detector library did not load. Check your internet connection and reload this page.");
+  if (!faceDetectorPromise) {
+    faceDetectorPromise = faceapi.nets.ssdMobilenetv1.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights").catch(() => {
+      faceDetectorPromise = null;
+      throw new Error("The face detection model could not load. Check your internet connection and reload the page.");
+    });
+  }
+  await faceDetectorPromise;
+}
+const FACE_DETECTION_OPTIONS = () => new faceapi.SsdMobilenetv1Options({ minConfidence: 0.72, maxResults: 5 });
+function drawFaceDetections(detections) {
+  if (!video.videoWidth || !video.videoHeight) return;
+  if (faceOverlay.width !== video.videoWidth || faceOverlay.height !== video.videoHeight) {
+    faceOverlay.width = video.videoWidth; faceOverlay.height = video.videoHeight;
+  }
+  const context = faceOverlay.getContext("2d");
+  context.clearRect(0, 0, faceOverlay.width, faceOverlay.height);
+  context.lineWidth = Math.max(2, video.videoWidth / 320);
+  context.strokeStyle = detections.length === 1 ? "#35d6a1" : "#ffb454";
+  detections.forEach(({ box }) => context.strokeRect(box.x, box.y, box.width, box.height));
+  if (detections.length === 0) {
+    faceDetectionStatus.textContent = "No face detected — move into the frame and face the camera.";
+    faceDetectionStatus.dataset.state = "waiting";
+  } else if (detections.length === 1) {
+    faceDetectionStatus.textContent = "One face detected — checking attendance…";
+    faceDetectionStatus.dataset.state = "ready";
+  } else {
+    faceDetectionStatus.textContent = detections.length + " faces detected — only one person should be in the frame.";
+    faceDetectionStatus.dataset.state = "multiple";
+  }
+}
+async function detectSingleVisibleFace() {
+  await ensureFaceDetector();
+  const detections = await faceapi.detectAllFaces(video, FACE_DETECTION_OPTIONS());
+  drawFaceDetections(detections);
+  if (detections.length !== 1) throw new Error(detections.length === 0 ? "No face detected. Center your face in the camera and try again." : "More than one face detected. Keep only one person in the camera frame and try again.");
+  return detections[0];
+}
 
 async function request(path, options = {}) {
   const response = await fetch(path, {
@@ -133,6 +176,9 @@ async function startCamera() {
   cameraOverlay.classList.remove("hidden");
   document.querySelector("#camera-overlay-text").textContent = "Requesting camera permission…";
   try {
+    document.querySelector("#camera-overlay-text").textContent = "Loading face detector…";
+    await ensureFaceDetector();
+    document.querySelector("#camera-overlay-text").textContent = "Requesting camera permission…";
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
@@ -163,6 +209,8 @@ function stopCamera() {
   if (cameraStream) cameraStream.getTracks().forEach((track) => track.stop());
   cameraStream = null;
   video.srcObject = null;
+  if (faceOverlay) { const context = faceOverlay.getContext("2d"); context.clearRect(0, 0, faceOverlay.width, faceOverlay.height); }
+  if (faceDetectionStatus) { faceDetectionStatus.textContent = "Camera is off."; faceDetectionStatus.dataset.state = "waiting"; }
 }
 
 document.querySelector("#camera-toggle").addEventListener("click", async () => {
@@ -174,13 +222,19 @@ document.querySelector("#camera-toggle").addEventListener("click", async () => {
   }
 });
 
-function captureFrame() {
+function captureFrame(detection) {
   if (!video.videoWidth || !video.videoHeight) throw new Error("Camera is still starting. Please wait a moment.");
-  const scale = Math.min(1, 640 / video.videoWidth);
-  canvas.width = Math.round(video.videoWidth * scale);
-  canvas.height = Math.round(video.videoHeight * scale);
-  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", 0.82);
+  if (!detection || !detection.box) throw new Error("A single face must be detected before capturing.");
+  const box = detection.box, paddingX = box.width * 0.32, paddingY = box.height * 0.38;
+  const left = Math.max(0, Math.floor(box.x - paddingX)), top = Math.max(0, Math.floor(box.y - paddingY));
+  const right = Math.min(video.videoWidth, Math.ceil(box.x + box.width + paddingX));
+  const bottom = Math.min(video.videoHeight, Math.ceil(box.y + box.height + paddingY));
+  const cropWidth = right - left, cropHeight = bottom - top;
+  if (cropWidth < 40 || cropHeight < 40) throw new Error("The detected face is too small. Move closer to the camera.");
+  const scale = Math.min(1, 800 / Math.max(cropWidth, cropHeight));
+  canvas.width = Math.max(1, Math.round(cropWidth * scale)); canvas.height = Math.max(1, Math.round(cropHeight * scale));
+  canvas.getContext("2d").drawImage(video, left, top, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.9);
 }
 
 async function scanFace({
@@ -191,7 +245,16 @@ async function scanFace({
   busy = true;
   let recognized = false;
   try {
-    const frame = captureFrame();
+    let detection;
+    try {
+      detection = await detectSingleVisibleFace();
+    } catch (detectionError) {
+      document.querySelector("#result-eyebrow").textContent = "FACE DETECTION";
+      document.querySelector("#result-title").textContent = "Adjust your position";
+      document.querySelector("#result-copy").textContent = detectionError.message;
+      return false;
+    }
+    const frame = captureFrame(detection);
     const result = await request("/api/recognize", {
       method: "POST",
       body: JSON.stringify({
@@ -545,15 +608,16 @@ document.querySelector("#self-enroll-form").addEventListener("submit", async (ev
   }
 });
 
-document.querySelector("#capture-self-pose").addEventListener("click", () => {
+document.querySelector("#capture-self-pose").addEventListener("click", async () => {
   try {
+    const detection = await detectSingleVisibleFace();
     let pose = enrollmentPoseOrder.find((item) => !selfEnrollmentImages[item]);
     if (!pose) {
       enrollmentPoseOrder.forEach((item) => delete selfEnrollmentImages[item]);
       renderSelfPoseProgress();
       pose = "center";
     }
-    selfEnrollmentImages[pose] = captureFrame();
+    selfEnrollmentImages[pose] = captureFrame(detection);
     renderSelfPoseProgress();
   } catch (error) {
     const notice = document.querySelector("#enroll-notice");
