@@ -1447,13 +1447,37 @@ def save_settings_api():
         if key in values:
             values[key] = "1" if values[key] in (True, 1, "1", "true") else "0"
     set_settings(values)
-    if schedule_changed and not active_before["configured"]:
-        get_active_schedule()
+    schedule_activated_today = False
+    schedule_updated_today = False
+    if schedule_changed:
+        today = current_day()
+        day_is_finalized = get_db().execute(
+            "SELECT 1 FROM attendance_days WHERE attendance_date=?",
+            (today,),
+        ).fetchone() is not None
+        if not active_before["configured"]:
+            get_active_schedule(today)
+            schedule_activated_today = True
+        elif not day_is_finalized:
+            # Update the active snapshot so the station and admin use the same current schedule.
+            # Existing attendance timestamps and statuses are deliberately left unchanged.
+            current_schedule = schedule_values(get_settings())
+            get_db().execute(
+                """INSERT INTO schedule_snapshots(attendance_date, schedule_json, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(attendance_date) DO UPDATE SET
+                       schedule_json=excluded.schedule_json,
+                       created_at=excluded.created_at""",
+                (today, json.dumps(current_schedule), stamp()),
+            )
+            get_db().commit()
+            schedule_updated_today = True
     return jsonify(
         ok=True,
         settings=get_settings(),
         schedule_state=schedule_status(),
-        schedule_activated_today=schedule_changed and not active_before["configured"],
+        schedule_activated_today=schedule_activated_today,
+        schedule_updated_today=schedule_updated_today,
     )
 
 
