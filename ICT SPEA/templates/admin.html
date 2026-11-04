@@ -26,17 +26,23 @@
       <article class="metric-card"><span class="metric-label">CONNECTED DEVICES</span><strong id="metric-devices">—</strong><span>Approved attendance stations</span></article>
       <article class="metric-card"><span class="metric-label">PENDING REQUESTS</span><strong id="metric-pending">—</strong><span>Awaiting admin confirmation</span></article>
     </section>
+    <div id="late-departure-alert" class="notice warning hidden" role="status" aria-live="polite"></div>
     <div class="admin-columns">
       <section id="schedule" class="panel admin-section">
         <div class="section-heading"><span class="section-icon">◷</span><div><h2>Schedule &amp; enrollment</h2><p class="muted">Set the school's attendance and departure rules.</p></div></div>
+        <div class="schedule-status" aria-live="polite">
+          <p id="active-schedule-status" class="help-text">Loading the active schedule…</p>
+          <p id="pending-schedule-status" class="help-text"></p>
+        </div>
         <form id="settings-form" class="form-grid">
-          <label>Attendance starts<input name="attendance_start" type="time" required></label>
-          <label>Attendance cut-off<input name="attendance_cutoff" type="time" required></label>
+          <label>Arrival Time<input name="attendance_start" type="time" required></label>
+          <label>Attendance Cut-off Time<input name="attendance_cutoff" type="time" required></label>
+          <label>Departure Time<input name="leaving_time" type="time" required></label>
           <label>Flexibility period (minutes)<input name="flexibility_minutes" type="number" min="0" max="180" required></label>
-          <label>Minimum time before early departure (minutes)<input name="minimum_early_leave_minutes" type="number" min="0" max="1440" required></label>
+          <label>Minimum Duration Before Early Departure (minutes)<input name="minimum_early_leave_minutes" type="number" min="0" max="1440" required></label>
           <button class="button primary full-span" type="submit">Save schedule settings</button>
         </form>
-        <p class="help-text">Arrivals before the attendance start or after cut-off + flexibility are rejected. Arrivals after the cut-off and within the flexibility period are marked Late. Arrivals are recorded once per person per day. The early-departure wait is measured from the original arrival.</p>
+        <p class="help-text">The flexibility period opens arrivals early, extends late-arrival acceptance after cut-off, and keeps regular check-out available after Departure Time. Check-out remains available beyond the grace period and is recorded as Late Departure. Changes to an active schedule apply on the next school day.</p>
       </section>
       <section class="panel admin-section codes-section">
         <div class="section-heading"><span class="section-icon">⌁</span><div><h2>Early-leave codes</h2><p class="muted">Five active one-time codes. Each expires 15 minutes after creation and is replaced immediately when used.</p></div></div>

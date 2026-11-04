@@ -1,5 +1,6 @@
 const csrf = document.body.dataset.csrf;
-const state = { people: [], attendance: [], devices: [], classes: [], settings: {}, capturedImages: {}, cameraStream: null };
+const state = { people: [], attendance: [], devices: [], classes: [], settings: {}, scheduleState: null, capturedImages: {}, cameraStream: null, today: "" };
+let attendanceLoadVersion = 0;
 const form = document.querySelector("#person-form");
 const classForm = document.querySelector("#class-form");
 
@@ -38,6 +39,8 @@ async function refreshDashboard() {
     state.devices = data.devices;
     state.classes = data.classes;
     state.settings = data.settings;
+    state.scheduleState = data.schedule_state;
+    state.today = data.date;
     document.querySelector("#today-date").textContent = data.date;
     document.querySelector("#report-date").value ||= data.date;
     document.querySelector("#metric-people").textContent = data.people.filter((person) => person.active).length;
@@ -45,6 +48,7 @@ async function refreshDashboard() {
     document.querySelector("#metric-devices").textContent = data.devices.length;
     document.querySelector("#metric-pending").textContent = data.pending_people.length;
     renderSettings(data.settings);
+    renderScheduleStatus(data.schedule_state);
     renderClasses();
     renderPeople();
     renderDevices(data.devices);
@@ -76,14 +80,49 @@ function renderSettings(settings) {
     settings.allow_unpaired_devices === "1";
 }
 
+function renderScheduleStatus(scheduleState) {
+  const activeStatus = document.querySelector("#active-schedule-status");
+  const pendingStatus = document.querySelector("#pending-schedule-status");
+  if (!scheduleState?.active?.configured) {
+    activeStatus.textContent = "No active schedule for today. Saving the first complete schedule activates it today.";
+    pendingStatus.textContent = "";
+    return;
+  }
+  const active = scheduleState.active;
+  activeStatus.textContent =
+    `Active for ${active.date}: arrival ${active.attendance_start}, cut-off ${active.attendance_cutoff}, departure ${active.leaving_time}; flexibility ${active.flexibility_minutes} min; minimum early-departure duration ${active.minimum_early_leave_minutes} min.`;
+  const pending = scheduleState.pending;
+  pendingStatus.textContent = scheduleState.has_pending_changes
+    ? `Pending from ${scheduleState.pending_effective_date}: arrival ${pending.attendance_start}, cut-off ${pending.attendance_cutoff}, departure ${pending.leaving_time}; flexibility ${pending.flexibility_minutes} min; minimum early-departure duration ${pending.minimum_early_leave_minutes} min. Today's schedule remains unchanged.`
+    : `No pending changes. Schedule changes saved now will take effect on ${scheduleState.pending_effective_date}.`;
+}
+
+async function refreshScheduleStatus() {
+  try {
+    const data = await api("/api/admin/schedule");
+    state.scheduleState = data.schedule_state;
+    state.today = data.date;
+    document.querySelector("#today-date").textContent = data.date;
+    renderScheduleStatus(data.schedule_state);
+  } catch (error) {
+    if (error.message !== "Please sign in again.") message(error.message, "error");
+  }
+}
+
 document.querySelector("#settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const values = Object.fromEntries(new FormData(event.currentTarget));
   values.flexibility_minutes = Number(values.flexibility_minutes);
   values.minimum_early_leave_minutes = Number(values.minimum_early_leave_minutes);
   try {
-    await api("/api/admin/settings", { method: "POST", body: JSON.stringify(values) });
-    message("Schedule settings saved.");
+    const result = await api("/api/admin/settings", { method: "POST", body: JSON.stringify(values) });
+    state.settings = result.settings;
+    state.scheduleState = result.schedule_state;
+    renderSettings(result.settings);
+    renderScheduleStatus(result.schedule_state);
+    message(result.schedule_activated_today
+      ? "The initial schedule is active for today."
+      : `Schedule changes saved and will take effect on ${result.schedule_state.pending_effective_date}.`);
   } catch (error) { message(error.message, "error"); }
 });
 
@@ -453,6 +492,12 @@ document.querySelector("#pending-teachers").addEventListener("click", async (eve
 
 function renderAttendance(rows) {
   document.querySelector("#empty-attendance").classList.toggle("hidden", rows.length > 0);
+  const lateDepartures = rows.filter((row) => row.departure_status === "Left Late");
+  const lateDepartureAlert = document.querySelector("#late-departure-alert");
+  lateDepartureAlert.classList.toggle("hidden", lateDepartures.length === 0);
+  lateDepartureAlert.textContent = lateDepartures.length
+    ? `Late departures on ${document.querySelector("#report-date").value}: ${lateDepartures.map((row) => `${row.name} (${row.departure_time || "time missing"})`).join(", ")}. Please review these records.`
+    : "";
   const groupFilter = document.querySelector("#attendance-group-filter");
   const selectedGroup = groupFilter.value;
   updateGroupFilter(groupFilter, rows, selectedGroup);
@@ -476,7 +521,7 @@ function renderAttendance(rows) {
       <td>${esc(row.group_name)}</td>
       <td><select data-field="attendance_status">${["Present", "Late", "Absent"].map((item) => `<option ${row.attendance_status === item ? "selected" : ""}>${item}</option>`).join("")}</select></td>
       <td><input data-field="arrival_time" type="time" value="${esc((row.arrival_time || "").slice(0, 5))}"></td>
-      <td><select data-field="departure_status">${["", "Left", "Left Early"].map((item) => `<option value="${item}" ${row.departure_status === item ? "selected" : ""}>${item || "—"}</option>`).join("")}</select></td>
+      <td><select data-field="departure_status">${["", "Left", "Left Early", "Left Late"].map((item) => `<option value="${item}" ${row.departure_status === item ? "selected" : ""}>${item || "—"}</option>`).join("")}</select></td>
       <td><input data-field="departure_time" type="time" value="${esc((row.departure_time || "").slice(0, 5))}"></td>
       <td><input data-field="early_leave_reason" value="${esc(row.early_leave_reason || "")}" placeholder="Reason" maxlength="500"></td>
       <td><button class="text-button" data-save-record="${row.id}">Save</button></td>
@@ -489,13 +534,24 @@ document.querySelector("#attendance-group-filter").addEventListener("change", ()
 async function loadAttendance() {
   const date = document.querySelector("#report-date").value;
   if (!date) return;
+  const version = ++attendanceLoadVersion;
   try {
     const data = await api(`/api/admin/attendance?date=${encodeURIComponent(date)}`);
+    if (version !== attendanceLoadVersion) return;
     state.attendance = data.attendance;
     renderAttendance(data.attendance);
-  } catch (error) { message(error.message, "error"); }
+    if (data.date === state.today) {
+      document.querySelector("#metric-attendance").textContent =
+        data.attendance.filter((row) => row.arrival_time).length;
+    }
+  } catch (error) {
+    if (version === attendanceLoadVersion) message(error.message, "error");
+  }
 }
 document.querySelector("#report-date").addEventListener("change", loadAttendance);
+window.setInterval(() => {
+  if (document.querySelector("#report-date").value === state.today) loadAttendance();
+}, 10_000);
 document.querySelector("#attendance-table").addEventListener("click", async (event) => {
   const deleteId = event.target.dataset.deleteRecord;
   if (deleteId) {
@@ -580,3 +636,4 @@ function renderPoseThumbnails(selector, images) {
 }
 refreshDashboard();
 window.setInterval(refreshEarlyCodes, 60_000);
+window.setInterval(refreshScheduleStatus, 30_000);

@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import io
+import json
+import math
 import os
 import re
 import secrets
@@ -37,6 +39,13 @@ DB_PATH = INSTANCE / "attendance.sqlite3"
 FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 FACE_THRESHOLD = float(os.environ.get("FACE_CONFIDENCE_THRESHOLD", "65"))
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+SCHEDULE_KEYS = (
+    "attendance_start",
+    "attendance_cutoff",
+    "leaving_time",
+    "flexibility_minutes",
+    "minimum_early_leave_minutes",
+)
 DEVICE_COOKIE = "attendance_device"
 DEVICE_CODE_CHARS = string.ascii_uppercase + string.digits
 EARLY_CODE_CHARS = string.ascii_uppercase + string.digits
@@ -67,7 +76,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
-    MAX_CONTENT_LENGTH=MAX_IMAGE_BYTES + 1024 * 1024,
+    MAX_CONTENT_LENGTH=MAX_IMAGE_BYTES * 4 + 1024 * 1024,
 )
 
 SCHEMA = """
@@ -131,6 +140,11 @@ CREATE TABLE IF NOT EXISTS attendance_days (
     attendance_date TEXT PRIMARY KEY,
     finalized_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS schedule_snapshots (
+    attendance_date TEXT PRIMARY KEY,
+    schedule_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS devices (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -166,13 +180,11 @@ CREATE INDEX IF NOT EXISTS people_active_idx ON people(active, confirmed, kind);
 """
 
 DEFAULT_SETTINGS = {
-    "attendance_start": "08:00",
-    "attendance_cutoff": "08:15",
+    "attendance_start": "",
+    "attendance_cutoff": "",
     "flexibility_minutes": "5",
     "minimum_early_leave_minutes": "30",
-    "leaving_time": "15:00",
-    "school_day_start": "08:00",
-    "school_day_end": "15:00",
+    "leaving_time": "",
     "self_enrollment": "0",
     "allow_unpaired_devices": "0",
 }
@@ -308,6 +320,21 @@ def init_db():
             (new_early_code(), stamp()),
         )
         active_code_count += 1
+    settings_values = DEFAULT_SETTINGS.copy()
+    settings_values.update(
+        {
+            row["key"]: row["value"]
+            for row in db.execute("SELECT key, value FROM settings").fetchall()
+        }
+    )
+    schedule = {key: settings_values[key] for key in SCHEDULE_KEYS}
+    if schedule_is_configured(schedule):
+        db.execute(
+            """INSERT OR IGNORE INTO schedule_snapshots(
+                   attendance_date, schedule_json, created_at
+               ) VALUES (?, ?, ?)""",
+            (now_local().date().isoformat(), json.dumps(schedule), stamp()),
+        )
     db.commit()
     db.close()
     with FACE_MODEL_LOCK:
@@ -556,6 +583,77 @@ def parse_clock_time(value):
     raise ValueError("Time must be a valid HH:MM or HH:MM:SS value.")
 
 
+def schedule_values(settings):
+    return {key: settings.get(key, "") for key in SCHEDULE_KEYS}
+
+
+def schedule_is_configured(schedule):
+    try:
+        for key in ("attendance_start", "attendance_cutoff", "leaving_time"):
+            parse_clock_time(schedule[key])
+        flexibility = int(schedule["flexibility_minutes"])
+        minimum = int(schedule["minimum_early_leave_minutes"])
+        return (
+            0 <= flexibility <= 180
+            and 0 <= minimum <= 1440
+            and parse_clock_time(schedule["attendance_start"])
+            <= parse_clock_time(schedule["attendance_cutoff"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def get_active_schedule(attendance_date=None):
+    day = attendance_date or current_day()
+    db = get_db()
+    row = db.execute(
+        "SELECT schedule_json FROM schedule_snapshots WHERE attendance_date=?",
+        (day,),
+    ).fetchone()
+    if row:
+        return {"date": day, "configured": True, **json.loads(row["schedule_json"])}
+
+    pending = schedule_values(get_settings())
+    if not schedule_is_configured(pending):
+        return {"date": day, "configured": False, **pending}
+
+    owns_transaction = not db.in_transaction
+    if owns_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    db.execute(
+        """INSERT OR IGNORE INTO schedule_snapshots(
+               attendance_date, schedule_json, created_at
+           ) VALUES (?, ?, ?)""",
+        (day, json.dumps(pending), stamp()),
+    )
+    if owns_transaction:
+        db.commit()
+    row = db.execute(
+        "SELECT schedule_json FROM schedule_snapshots WHERE attendance_date=?",
+        (day,),
+    ).fetchone()
+    return {"date": day, "configured": True, **json.loads(row["schedule_json"])}
+
+
+def schedule_status():
+    today = current_day()
+    active = get_active_schedule(today)
+    pending = schedule_values(get_settings())
+    has_pending_changes = active["configured"] and any(
+        str(active[key]) != str(pending[key]) for key in SCHEDULE_KEYS
+    )
+    return {
+        "active": active,
+        "pending": pending,
+        "has_pending_changes": has_pending_changes,
+        "pending_effective_date": (
+            (now_local().date() + timedelta(days=1)).isoformat()
+            if active["configured"]
+            else today
+        ),
+    }
+
+
 def parse_iso_date(value):
     if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         return None
@@ -567,12 +665,19 @@ def parse_iso_date(value):
 
 
 def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction_open=False):
-    if event_mode == "departure" and not transaction_open:
+    if event_mode in {"departure", "early_departure"} and not transaction_open:
         refresh_early_codes()
+    if event_mode not in {"arrival", "departure", "early_departure"}:
+        return {"error": "Unsupported attendance event."}
     db = get_db()
     now = now_local()
     today = now.date().isoformat()
-    settings = get_settings()
+    settings = get_active_schedule(today)
+    if not settings["configured"]:
+        return {
+            "error": "The school schedule has not been configured. Please contact an administrator.",
+            "schedule_not_configured": True,
+        }
     clock = now.strftime("%H:%M:%S")
     if not transaction_open:
         db.execute("BEGIN IMMEDIATE")
@@ -596,10 +701,14 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
             return {"message": "Arrival is already recorded for today.", "record": dict(row), "duplicate": True}
         start = parse_clock_time(settings["attendance_start"])
         start_at = datetime.combine(now.date(), start).replace(tzinfo=now.tzinfo)
-        if now < start_at:
+        arrival_opens_at = start_at - timedelta(minutes=int(settings["flexibility_minutes"]))
+        if now < arrival_opens_at:
             db.rollback()
             return {
-                "error": f"Attendance opens at {start.strftime('%H:%M')}.",
+                "error": (
+                    "Arrival opens at "
+                    f"{arrival_opens_at.strftime('%H:%M')} including the flexibility period."
+                ),
                 "attendance_not_open": True,
             }
         cutoff = parse_clock_time(settings["attendance_cutoff"])
@@ -655,7 +764,17 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
     arrival_datetime = datetime.combine(now.date(), arrival_clock).replace(tzinfo=now.tzinfo)
     elapsed_seconds = max(0, int((now - arrival_datetime).total_seconds()))
     leaving_time = parse_clock_time(settings["leaving_time"])
-    if now.time() < leaving_time:
+    departure_at = datetime.combine(now.date(), leaving_time).replace(tzinfo=now.tzinfo)
+    if event_mode == "early_departure" and now >= departure_at:
+        db.rollback()
+        return {
+            "error": (
+                f"The early-leave window closed at {leaving_time.strftime('%H:%M')}. "
+                "Scan again to check out normally."
+            ),
+            "early_departure_closed": True,
+        }
+    if event_mode == "early_departure" or now < departure_at:
         minimum_seconds = int(settings["minimum_early_leave_minutes"]) * 60
         remaining_seconds = max(0, minimum_seconds - elapsed_seconds)
         if remaining_seconds:
@@ -707,10 +826,12 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
         saved = db.execute("SELECT * FROM attendance WHERE id = ?", (row["id"],)).fetchone()
         return {"message": "Early departure recorded.", "record": dict(saved), "duplicate": False}
 
+    grace_end = departure_at + timedelta(minutes=int(settings["flexibility_minutes"]))
+    departure_status = "Left Late" if now > grace_end else "Left"
     db.execute(
-        """UPDATE attendance SET departure_status='Left', departure_time=?
+        """UPDATE attendance SET departure_status=?, departure_time=?
            WHERE id=? AND departure_time IS NULL""",
-        (clock, row["id"]),
+        (departure_status, clock, row["id"]),
     )
     if db.execute("SELECT changes()").fetchone()[0] != 1:
         db.rollback()
@@ -720,7 +841,17 @@ def ensure_attendance(person_id, event_mode, code=None, reason=None, transaction
         "SELECT * FROM attendance WHERE person_id = ? AND attendance_date = ?",
         (person_id, today),
     ).fetchone()
-    return {"message": "Departure recorded: Left.", "record": dict(saved), "duplicate": False}
+    message = (
+        "Late departure recorded for administrator review."
+        if departure_status == "Left Late"
+        else "Departure recorded: Left."
+    )
+    return {
+        "message": message,
+        "record": dict(saved),
+        "duplicate": False,
+        "late_departure": departure_status == "Left Late",
+    }
 
 
 def new_early_code():
@@ -905,6 +1036,7 @@ def dashboard_api():
     return jsonify(
         date=current_day(),
         settings=get_settings(),
+        schedule_state=schedule_status(),
         people=[person_json(row) for row in rows],
         classes=[dict(row) for row in classes],
         attendance=[dict(row) for row in attendance],
@@ -914,6 +1046,12 @@ def dashboard_api():
             "SELECT id, kind, name, group_name FROM people WHERE confirmed=0 AND active=1"
         ).fetchall()],
     )
+
+
+@app.get("/api/admin/schedule")
+@admin_required
+def admin_schedule_api():
+    return jsonify(date=current_day(), schedule_state=schedule_status())
 
 
 @app.post("/api/admin/classes")
@@ -1025,13 +1163,11 @@ def save_settings_api():
         "flexibility_minutes",
         "minimum_early_leave_minutes",
         "leaving_time",
-        "school_day_start",
-        "school_day_end",
         "self_enrollment",
         "allow_unpaired_devices",
     }
     values = {key: data[key] for key in allowed if key in data}
-    for key in ("attendance_start", "attendance_cutoff", "leaving_time", "school_day_start", "school_day_end"):
+    for key in ("attendance_start", "attendance_cutoff", "leaving_time"):
         if key in values and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(values[key])):
             return api_error(f"{key.replace('_', ' ').title()} must be a valid 24-hour time.")
     if "flexibility_minutes" in values:
@@ -1048,11 +1184,27 @@ def save_settings_api():
                 raise ValueError
         except (ValueError, TypeError):
             return api_error("Minimum time before early departure must be between 0 and 1440 minutes.")
+    schedule_changed = bool(set(values) & set(SCHEDULE_KEYS))
+    active_before = get_active_schedule()
+    effective_settings = get_settings()
+    effective_settings.update({key: str(value) for key, value in values.items()})
+    candidate_schedule = schedule_values(effective_settings)
+    if schedule_changed and not schedule_is_configured(candidate_schedule):
+        return api_error(
+            "Enter valid arrival, cut-off, and departure times, with arrival at or before the cut-off."
+        )
     for key in ("self_enrollment", "allow_unpaired_devices"):
         if key in values:
             values[key] = "1" if values[key] in (True, 1, "1", "true") else "0"
     set_settings(values)
-    return jsonify(ok=True, settings=get_settings())
+    if schedule_changed and not active_before["configured"]:
+        get_active_schedule()
+    return jsonify(
+        ok=True,
+        settings=get_settings(),
+        schedule_state=schedule_status(),
+        schedule_activated_today=schedule_changed and not active_before["configured"],
+    )
 
 
 @app.post("/api/admin/people")
@@ -1293,6 +1445,7 @@ def attendance_state_api():
             (hashlib.sha256(token.encode()).hexdigest(),),
         ).fetchone()
     settings = get_settings()
+    active_schedule = get_active_schedule()
     classes = db.execute(
         "SELECT id, name FROM classes WHERE active=1 ORDER BY name COLLATE NOCASE"
     ).fetchall()
@@ -1318,11 +1471,7 @@ def attendance_state_api():
         allow_unpaired_devices=settings["allow_unpaired_devices"] == "1",
         classes=[dict(row) for row in classes],
         schedule={
-            "attendance_start": settings["attendance_start"],
-            "attendance_cutoff": settings["attendance_cutoff"],
-            "flexibility_minutes": settings["flexibility_minutes"],
-            "minimum_early_leave_minutes": settings["minimum_early_leave_minutes"],
-            "leaving_time": settings["leaving_time"],
+            **active_schedule,
         },
     )
     if response_token:
@@ -1369,6 +1518,20 @@ def recognize_api():
     if not person:
         return jsonify(recognized=False, error="That person is no longer active.")
     now = now_local()
+    settings = get_active_schedule(now.date().isoformat())
+    if not settings["configured"]:
+        return jsonify(
+            recognized=True,
+            schedule_unconfigured=True,
+            error="The school schedule has not been configured. Please contact an administrator.",
+            person={
+                "id": person["id"],
+                "kind": person["kind"],
+                "name": person["name"],
+                "group_name": person["group_name"],
+            },
+            confidence=round(float(confidence), 1),
+        )
     stored_row = get_db().execute(
         "SELECT departure_time, finalized FROM attendance WHERE person_id=? AND attendance_date=?",
         (person_id, now.date().isoformat()),
@@ -1398,8 +1561,21 @@ def recognize_api():
     ).fetchone()
     first_arrival = not result.get("duplicate", False)
     mode = "arrival" if first_arrival else "departure"
-    settings = get_settings()
     leaving = parse_clock_time(settings["leaving_time"])
+    leaving_datetime = datetime.combine(now.date(), leaving).replace(tzinfo=now.tzinfo)
+    departure_grace_ends_at = leaving_datetime + timedelta(
+        minutes=int(settings["flexibility_minutes"])
+    )
+    early_leave_closes_in_seconds = max(
+        0,
+        math.ceil((leaving_datetime - now).total_seconds()),
+    )
+    late_departure_remaining_seconds = max(
+        0,
+        math.ceil((departure_grace_ends_at - now).total_seconds()),
+    )
+    if leaving_datetime <= now <= departure_grace_ends_at:
+        late_departure_remaining_seconds = max(1, late_departure_remaining_seconds)
     early_remaining_seconds = 0
     if attendance_row["arrival_time"]:
         arrival_clock = parse_clock_time(attendance_row["arrival_time"])
@@ -1417,7 +1593,7 @@ def recognize_api():
         not first_arrival
         and not attendance_row["departure_time"]
         and not attendance_row["finalized"]
-        and now.time() >= leaving
+        and now >= leaving_datetime
     ):
         result = ensure_attendance(person_id, "departure")
         if result.get("error"):
@@ -1429,7 +1605,7 @@ def recognize_api():
     early_available = (
         not attendance_row["departure_time"]
         and not attendance_row["finalized"]
-        and now.time() < leaving
+        and now < leaving_datetime
         and early_remaining_seconds == 0
     )
     requested_early_departure = data.get("confirm_early_departure") is True
@@ -1452,7 +1628,12 @@ def recognize_api():
         ticket=ticket,
         mode=mode,
         first_arrival=first_arrival,
-        remaining_seconds=early_remaining_seconds if now.time() < leaving else 0,
+        remaining_seconds=early_remaining_seconds if now < leaving_datetime else 0,
+        early_leave_closes_in_seconds=early_leave_closes_in_seconds,
+        late_departure_remaining_seconds=late_departure_remaining_seconds,
+        late_departure=now > departure_grace_ends_at,
+        leaving_time=leaving.strftime("%H:%M"),
+        flexibility_minutes=int(settings["flexibility_minutes"]),
         minimum_early_leave_minutes=int(settings["minimum_early_leave_minutes"]),
         early_available=early_available,
         already_departed=departed,
@@ -1464,7 +1645,7 @@ def recognize_api():
             "departure": attendance_row["departure_status"] if attendance_row else "",
             "departure_time": attendance_row["departure_time"] if attendance_row else None,
         },
-        departure_action="Leave Early" if now.time() < leaving else "Check Out",
+        departure_action="Leave Early" if now < leaving_datetime else "Check Out",
     )
 
 
@@ -1477,6 +1658,12 @@ def early_leave_api():
         return api_error("Face verification expired. Scan your face again to continue.")
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     db = get_db()
+    refresh_early_codes()
+    if not get_active_schedule()["configured"]:
+        return api_error(
+            "The school schedule has not been configured. Please contact an administrator.",
+            409,
+        )
     db.execute("BEGIN IMMEDIATE")
     ticket = db.execute(
         """SELECT person_id FROM face_tickets
@@ -1488,13 +1675,13 @@ def early_leave_api():
         return api_error("Face verification expired. Scan your face again to continue.")
     result = ensure_attendance(
         ticket["person_id"],
-        "departure",
+        "early_departure",
         code=str(data.get("code", "")),
         reason=str(data.get("reason", "")),
         transaction_open=True,
     )
     if result.get("error"):
-        return api_error(result["error"])
+        return api_error(result["error"], 409 if result.get("early_departure_closed") else 400)
     if result.get("duplicate"):
         db.rollback()
         return api_error("A departure is already recorded for today.", 409)
@@ -1613,7 +1800,7 @@ def correct_attendance_api(record_id):
         return api_error("Attendance record not found.", 404)
     allowed = {
         "attendance_status": {"Present", "Late", "Absent"},
-        "departure_status": {"", "Left", "Left Early"},
+        "departure_status": {"", "Left", "Left Early", "Left Late"},
     }
     updates = {}
     for field in ("attendance_status", "departure_status", "arrival_time", "departure_time", "early_leave_reason"):
@@ -1747,6 +1934,12 @@ def export_report_api():
            ORDER BY kind, group_name, name""",
         (requested_date,),
     ).fetchall()
+
+    def safe_excel_value(value):
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+            return "'" + value
+        return value
+
     class_names = sorted({row["group_name"] for row in rows if row["kind"] == "student"})
     sheet_names = {}
     for group in class_names:
@@ -1773,18 +1966,21 @@ def export_report_api():
             ):
                 sheet.append(
                     [
-                        row["attendance_date"],
-                        row["name"],
-                        row["student_number"] or "",
-                        row["group_name"],
-                        row["attendance_status"],
-                        row["arrival_time"] or "",
-                        (
-                            row["departure_status"]
-                            or ("Did Not Depart" if row["kind"] == "teacher" else "")
-                        ),
-                        row["departure_time"] or "",
-                        row["early_leave_reason"] or "",
+                        safe_excel_value(value)
+                        for value in [
+                            row["attendance_date"],
+                            row["name"],
+                            row["student_number"] or "",
+                            row["group_name"],
+                            row["attendance_status"],
+                            row["arrival_time"] or "",
+                            (
+                                row["departure_status"]
+                                or ("Did Not Depart" if row["kind"] == "teacher" else "")
+                            ),
+                            row["departure_time"] or "",
+                            row["early_leave_reason"] or "",
+                        ]
                     ]
                 )
         sheet.auto_filter.ref = f"A1:I{sheet.max_row}"
@@ -1803,7 +1999,7 @@ def export_report_api():
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return jsonify(error="Image is too large. Capture a smaller camera image and try again."), 413
+    return jsonify(error="The image request is too large. Capture smaller photos and try again."), 413
 
 
 init_db()

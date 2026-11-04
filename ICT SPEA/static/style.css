@@ -140,6 +140,9 @@ textarea { resize: vertical; }
 .admin-section { padding: 21px; margin-bottom: 16px; }
 .admin-section > .section-heading { margin-bottom: 19px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+.schedule-status { margin: -4px 0 16px; padding: 11px 13px; border: 1px solid #e1ebf0; border-radius: 9px; background: #f7fafb; }
+.schedule-status .help-text { margin: 0; color: #60788b; }
+.schedule-status .help-text + .help-text { margin-top: 5px; }
 .full-span { grid-column: 1 / -1; }
 .checkbox-label { display: flex; align-items: center; gap: 10px; padding: 8px 2px 2px; color: #52677b; font-weight: 600; }
 .checkbox-label input { width: 17px; height: 17px; margin: 0; accent-color: var(--blue); }

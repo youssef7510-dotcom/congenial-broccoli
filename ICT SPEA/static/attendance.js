@@ -13,6 +13,7 @@ let currentTicket = null;
 let selfEnrollmentAllowed = false;
 let busy = false;
 let pairingPoll = null;
+let shouldAutoStartCamera = true;
 const selfEnrollmentImages = {};
 const enrollmentPoseOrder = ["center", "left", "right"];
 let availableClasses = [];
@@ -50,14 +51,29 @@ async function checkPairing() {
     availableClasses = state.classes || [];
     renderSelfClassOptions();
     if (state.paired) {
-      if (pairingPoll) window.clearInterval(pairingPoll);
-      pairingPoll = null;
+      if (!pairingPoll) pairingPoll = window.setInterval(checkPairing, 10000);
       pairPanel.classList.add("hidden");
       stationPanel.classList.remove("hidden");
       document.querySelector("#connection-dot").classList.add("online");
+      if (!state.schedule?.configured) {
+        shouldAutoStartCamera = true;
+        stopCamera();
+        setCameraStatus("Schedule not configured");
+        document.querySelector("#result-eyebrow").textContent = "ATTENDANCE UNAVAILABLE";
+        document.querySelector("#result-title").textContent = "Schedule not configured";
+        document.querySelector("#result-copy").textContent =
+          "Please contact an administrator to set today's attendance schedule.";
+        document.querySelector("#early-panel").classList.add("hidden");
+        document.querySelector("#add-person-panel").classList.add("hidden");
+        return;
+      }
       setCameraStatus("Device connected");
-      startCamera();
+      if (shouldAutoStartCamera) {
+        shouldAutoStartCamera = false;
+        startCamera();
+      }
     } else {
+      shouldAutoStartCamera = true;
       stationPanel.classList.add("hidden");
       pairPanel.classList.remove("hidden");
       pairPanel.querySelector(".muted").textContent = state.allow_unpaired_devices
@@ -66,9 +82,7 @@ async function checkPairing() {
       document.querySelector("#connection-dot").classList.remove("online");
       setCameraStatus("Device not connected");
       stopCamera();
-      if (!pairingPoll) {
-        pairingPoll = window.setInterval(checkPairing, 10000);
-      }
+      if (!pairingPoll) pairingPoll = window.setInterval(checkPairing, 10000);
     }
   } catch {
     setCameraStatus("Unable to check device");
@@ -171,6 +185,19 @@ async function scanFace({ confirmEarlyDeparture = false } = {}) {
         showNotice("Attendance was not recorded because the arrival window has closed.", "error");
         return true;
       }
+      if (result.schedule_unconfigured) {
+        if (scanTimer) window.clearInterval(scanTimer);
+        scanTimer = null;
+        document.querySelector("#result-eyebrow").textContent = "ATTENDANCE UNAVAILABLE";
+        document.querySelector("#result-title").textContent = "Schedule not configured";
+        document.querySelector("#result-copy").textContent = result.error;
+        document.querySelector("#person-details").classList.add("hidden");
+        document.querySelector("#early-panel").classList.add("hidden");
+        document.querySelector("#add-person-panel").classList.add("hidden");
+        document.querySelector("#next-scan").classList.add("hidden");
+        showNotice(result.error, "error");
+        return true;
+      }
       currentTicket = result.ticket;
       if (scanTimer) window.clearInterval(scanTimer);
       scanTimer = null;
@@ -215,6 +242,7 @@ function renderRecognized(result) {
   const departurePanel = document.querySelector("#early-panel");
   const leaveButton = document.querySelector("#leave-early-trigger");
   const earlyForm = document.querySelector("#early-form");
+  const attendanceStatus = result.current_status.attendance;
   if (countdownTimer) window.clearInterval(countdownTimer);
   if (result.already_departed) {
     departurePanel.classList.add("hidden");
@@ -236,15 +264,20 @@ function renderRecognized(result) {
   }
   earlyForm.classList.add("hidden");
   leaveButton.classList.remove("hidden");
-  leaveButton.disabled = result.remaining_seconds > 0;
-  leaveButton.textContent = result.departure_action === "Check Out"
-    ? "Check Out"
-    : "Leave Early";
-  const attendanceStatus = result.current_status.attendance || "Present";
+  const isRegularCheckout = result.departure_action === "Check Out";
+  leaveButton.dataset.action = isRegularCheckout ? "checkout" : "early";
+  leaveButton.disabled = isRegularCheckout
+    ? false
+    : result.remaining_seconds > 0;
+  leaveButton.textContent = isRegularCheckout ? "Check Out" : "Leave Early";
   updateLeaveCountdown(
     result.remaining_seconds || 0,
     result.minimum_early_leave_minutes,
     attendanceStatus,
+    result.early_leave_closes_in_seconds
+      ?? (isRegularCheckout ? 0 : Number.MAX_SAFE_INTEGER),
+    result.leaving_time || "",
+    result.late_departure_remaining_seconds || 0,
   );
   document.querySelector("#result-copy").textContent = result.first_arrival
     ? attendanceStatus === "Late"
@@ -253,26 +286,49 @@ function renderRecognized(result) {
     : `You're already marked ${attendanceStatus.toLowerCase()}.`;
 }
 
-function updateLeaveCountdown(secondsRemaining, minimumMinutes = 30, attendanceStatus = "Present") {
+function updateLeaveCountdown(
+  secondsRemaining,
+  minimumMinutes = 30,
+  attendanceStatus = "Present",
+  earlyWindowSeconds = Number.MAX_SAFE_INTEGER,
+  leavingTime = "",
+  lateDepartureSeconds = 0,
+) {
   const leaveButton = document.querySelector("#leave-early-trigger");
   const countdown = document.querySelector("#leave-countdown");
   const update = () => {
-    if (secondsRemaining <= 0) {
+    if (earlyWindowSeconds <= 0) {
       leaveButton.disabled = false;
+      leaveButton.dataset.action = "checkout";
+      leaveButton.textContent = "Check Out";
+      if (lateDepartureSeconds > 0) {
+        const minutes = Math.floor(lateDepartureSeconds / 60);
+        const seconds = lateDepartureSeconds % 60;
+        countdown.textContent = `Regular check-out is available now. Departure flexibility ends in ${minutes}:${String(seconds).padStart(2, "0")}.`;
+      } else {
+        countdown.textContent = "The departure flexibility period has ended. Check out now; this will be recorded as Late Departure.";
+      }
+    } else if (secondsRemaining <= 0) {
+      leaveButton.disabled = false;
+      leaveButton.dataset.action = "early";
       leaveButton.textContent = "Leave Early";
-      countdown.textContent = `You're already marked ${attendanceStatus.toLowerCase()}. The ${minimumMinutes}-minute wait is complete. Press the button and scan your face again to continue.`;
-      if (countdownTimer) window.clearInterval(countdownTimer);
-      countdownTimer = null;
-      return;
+      countdown.textContent = `You're already marked ${attendanceStatus.toLowerCase()}. The ${minimumMinutes}-minute wait is complete. Press Leave Early and scan your face again to continue. Early departure is available until ${leavingTime || "normal checkout"}.`;
+    } else {
+      leaveButton.disabled = true;
+      leaveButton.dataset.action = "early";
+      leaveButton.textContent = "Leave Early";
+      const minutes = Math.floor(secondsRemaining / 60);
+      const seconds = secondsRemaining % 60;
+      countdown.textContent = `You're already marked ${attendanceStatus.toLowerCase()}. Early departure requires ${minimumMinutes} minutes from arrival. Time remaining: ${minutes}:${String(seconds).padStart(2, "0")}.`;
+      if (secondsRemaining >= earlyWindowSeconds) {
+        countdown.textContent += ` The early-leave window closes at ${leavingTime || "normal checkout"}, before the wait is complete.`;
+      }
     }
-    leaveButton.disabled = true;
-    leaveButton.textContent = "I want to leave early";
-    const minutes = Math.floor(secondsRemaining / 60);
-    const seconds = secondsRemaining % 60;
-    countdown.textContent = `You're already marked ${attendanceStatus.toLowerCase()}. The early-leave option will be available after ${minimumMinutes} minutes from arrival. Time remaining: ${minutes}:${String(seconds).padStart(2, "0")}.`;
-    secondsRemaining -= 1;
+    secondsRemaining = Math.max(0, secondsRemaining - 1);
+    earlyWindowSeconds = Math.max(0, earlyWindowSeconds - 1);
+    lateDepartureSeconds = Math.max(0, lateDepartureSeconds - 1);
   };
-  const shouldStartTimer = secondsRemaining > 0;
+  const shouldStartTimer = earlyWindowSeconds > 0 || lateDepartureSeconds > 0;
   update();
   if (shouldStartTimer) countdownTimer = window.setInterval(update, 1000);
 }
@@ -293,7 +349,9 @@ function showUnknownFlow() {
 
 document.querySelector("#leave-early-trigger").addEventListener("click", async (event) => {
   event.currentTarget.disabled = true;
-  const recognized = await scanFace({ confirmEarlyDeparture: true });
+  const recognized = await scanFace({
+    confirmEarlyDeparture: event.currentTarget.dataset.action !== "checkout",
+  });
   if (!recognized) event.currentTarget.disabled = false;
 });
 
@@ -333,7 +391,18 @@ document.querySelector("#early-form").addEventListener("submit", async (event) =
     currentTicket = null;
   } catch (error) {
     showNotice(error.message, "error");
-    if (error.message.includes("Face verification expired")) {
+    if (error.message.toLowerCase().includes("window closed")) {
+      currentTicket = null;
+      document.querySelector("#early-form").classList.add("hidden");
+      document.querySelector("#departure-heading").textContent = "Check Out";
+      document.querySelector("#leave-countdown").textContent =
+        "The early-leave window has closed. Scan again to check out normally.";
+      const leaveButton = document.querySelector("#leave-early-trigger");
+      leaveButton.classList.remove("hidden");
+      leaveButton.disabled = false;
+      leaveButton.dataset.action = "checkout";
+      leaveButton.textContent = "Check Out";
+    } else if (error.message.includes("Face verification expired")) {
       currentTicket = null;
       document.querySelector("#early-form").classList.add("hidden");
       const leaveButton = document.querySelector("#leave-early-trigger");

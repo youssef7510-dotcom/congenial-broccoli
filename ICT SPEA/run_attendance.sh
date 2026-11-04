@@ -36,7 +36,7 @@ fi
 
 printf '\nStarting AttendAI at http://127.0.0.1:%s\n' "$PORT"
 if [ "$PAGE" = "/admin" ]; then
-  printf 'Opening administrator sign-in. Demo login: admin / admin123!\n'
+  printf 'Opening administrator sign-in. Demo login: admin / admin123\n'
 else
   printf 'Opening the attendance station. Pair this browser in Admin first.\n'
 fi
