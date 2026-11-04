@@ -197,7 +197,7 @@ async function startCamera() {
     cameraOverlay.classList.add("hidden");
     cameraError.textContent = error.name === "NotAllowedError"
       ? "Camera permission was denied. Allow camera access in Chrome’s address-bar settings, then try again."
-      : "Could not start the camera. Check that a camera is connected and that this page is using localhost or HTTPS.";
+      : (error.message || "Could not start the camera. Check that a camera is connected and that this page is using localhost or HTTPS.");
     cameraError.classList.remove("hidden");
     setCameraStatus("Camera unavailable");
   }
