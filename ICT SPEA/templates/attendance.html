@@ -33,12 +33,14 @@
         <div class="camera-topline"><span class="live-pill"><i></i> LIVE CAMERA</span><span class="camera-hint">Keep your face centered</span></div>
         <div class="camera-frame">
           <video id="camera" autoplay playsinline muted></video>
+          <canvas id="face-overlay" aria-hidden="true"></canvas>
           <div class="face-guide"><span></span></div>
           <div class="camera-overlay hidden" id="camera-overlay"><span class="spinner"></span><span id="camera-overlay-text">Starting camera…</span></div>
         </div>
         <div class="station-controls">
           <button class="button secondary" id="camera-toggle" type="button">Start camera</button>
         </div>
+        <p id="face-detection-status" class="face-detection-status" data-state="waiting" aria-live="polite">Waiting for the face detector…</p>
         <p class="camera-error notice error hidden" id="camera-error"></p>
       </div>
       <div class="result-column">
@@ -81,6 +83,7 @@
     </section>
   </main>
   <footer class="page-footer"><span>AttendAI · School attendance</span><span id="clock"></span></footer>
-  <script src="{{ url_for('static', filename='attendance.js') }}"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script defer src="{{ url_for('static', filename='attendance.js') }}"></script>
 </body>
 </html>
