@@ -225,30 +225,67 @@ async function startCamera() {
   if (cameraStream) return;
   cameraError.classList.add("hidden");
   cameraOverlay.classList.remove("hidden");
-  document.querySelector("#camera-overlay-text").textContent = "Requesting camera permission…";
+  const overlayText = document.querySelector("#camera-overlay-text");
+  const cameraButton = document.querySelector("#camera-toggle");
+
   try {
-    document.querySelector("#camera-overlay-text").textContent = "Loading face detector…";
-    await ensureFaceDetector();
-    document.querySelector("#camera-overlay-text").textContent = "Requesting camera permission…";
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error(
+        window.isSecureContext
+          ? "Camera access is unavailable in this browser. Update Chrome or try another supported browser."
+          : "Camera access requires HTTPS or localhost. Open this page using http://localhost:5001 or an HTTPS address."
+      );
+    }
+
+    overlayText.textContent = "Requesting camera permission…";
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
       audio: false,
     });
+
     video.srcObject = cameraStream;
     await video.play();
     cameraOverlay.classList.add("hidden");
-    document.querySelector("#camera-toggle").textContent = "Stop camera";
+    cameraButton.textContent = "Stop camera";
+    document.querySelector("#result-title").textContent = "Camera connected";
+    document.querySelector("#result-copy").textContent = "Loading face detection…";
+    setCameraStatus("Camera connected");
+
+    try {
+      await ensureFaceDetector();
+    } catch (detectorError) {
+      faceDetectionStatus.textContent = "Camera is on, but face detection could not load.";
+      faceDetectionStatus.dataset.state = "waiting";
+      cameraError.textContent =
+        "The camera is working, but the face detector could not load. Check your internet connection and reload. Details: " +
+        detectorError.message;
+      cameraError.classList.remove("hidden");
+      document.querySelector("#result-title").textContent = "Face detector unavailable";
+      document.querySelector("#result-copy").textContent = "The camera preview is active, but attendance scanning is paused until face detection loads.";
+      setCameraStatus("Face detector unavailable");
+      return;
+    }
+
+    cameraError.classList.add("hidden");
     document.querySelector("#result-title").textContent = "Looking for a face";
     document.querySelector("#result-copy").textContent = "Recognition retries automatically while the camera is active.";
     scanTimer = window.setInterval(scanFace, 2200);
     scanFace();
   } catch (error) {
     stopCamera();
-    document.querySelector("#camera-toggle").textContent = "Start camera";
+    cameraButton.textContent = "Start camera";
     cameraOverlay.classList.add("hidden");
-    cameraError.textContent = error.name === "NotAllowedError"
-      ? "Camera permission was denied. Allow camera access in Chrome’s address-bar settings, then try again."
-      : (error.message || "Could not start the camera. Check that a camera is connected and that this page is using localhost or HTTPS.");
+
+    const messages = {
+      NotAllowedError: "Camera permission was denied or blocked. Allow camera access for this site in Chrome's address-bar settings, then reload.",
+      NotFoundError: "No camera was found. Connect a camera or select an available camera.",
+      NotReadableError: "The camera is already being used by another app, or the device could not be opened. Close other camera apps and try again.",
+      OverconstrainedError: "The camera does not support the requested video settings. Check the connected camera and try again.",
+      SecurityError: "The browser blocked camera access for security reasons. Use localhost or HTTPS and check the site's camera permission.",
+      AbortError: "The camera could not start. Try again, and check whether another app is using it.",
+      TypeError: "Camera access is unavailable. Open this page using localhost or HTTPS in a supported browser.",
+    };
+    cameraError.textContent = messages[error.name] || (error.message || "Could not start the camera. Check browser permissions and make sure a camera is connected.");
     cameraError.classList.remove("hidden");
     setCameraStatus("Camera unavailable");
   }
