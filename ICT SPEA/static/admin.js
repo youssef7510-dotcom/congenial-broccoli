@@ -93,8 +93,8 @@ function renderScheduleStatus(scheduleState) {
     `Active for ${active.date}: arrival ${active.attendance_start}, cut-off ${active.attendance_cutoff}, departure ${active.leaving_time}; flexibility ${active.flexibility_minutes} min; minimum early-departure duration ${active.minimum_early_leave_minutes} min.`;
   const pending = scheduleState.pending;
   pendingStatus.textContent = scheduleState.has_pending_changes
-    ? `Pending from ${scheduleState.pending_effective_date}: arrival ${pending.attendance_start}, cut-off ${pending.attendance_cutoff}, departure ${pending.leaving_time}; flexibility ${pending.flexibility_minutes} min; minimum early-departure duration ${pending.minimum_early_leave_minutes} min. Today's schedule remains unchanged.`
-    : `No pending changes. Schedule changes saved now will take effect on ${scheduleState.pending_effective_date}.`;
+    ? `Saved schedule changes will take effect from ${scheduleState.pending_effective_date} because this attendance day has already been finalized. New settings: arrival ${pending.attendance_start}, cut-off ${pending.attendance_cutoff}, departure ${pending.leaving_time}; flexibility ${pending.flexibility_minutes} min; minimum early-departure duration ${pending.minimum_early_leave_minutes} min.`
+    : "Schedule changes are editable and take effect immediately for today. Previously recorded arrival/departure times and statuses are not rewritten.";
 }
 
 async function refreshScheduleStatus() {
@@ -122,7 +122,9 @@ document.querySelector("#settings-form").addEventListener("submit", async (event
     renderScheduleStatus(result.schedule_state);
     message(result.schedule_activated_today
       ? "The initial schedule is active for today."
-      : `Schedule changes saved and will take effect on ${result.schedule_state.pending_effective_date}.`);
+      : result.schedule_updated_today
+        ? "The active schedule has been updated. New times apply immediately to future attendance actions."
+        : `The attendance day is already finalized. The new schedule is saved for ${result.schedule_state.pending_effective_date}.`);
   } catch (error) { message(error.message, "error"); }
 });
 
