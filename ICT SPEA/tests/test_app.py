@@ -372,62 +372,49 @@ class AttendanceSystemTests(unittest.TestCase):
         self.assertIn("pending-schedule-status", dashboard)
         self.assertIn("Departure Time", settings_form)
 
-    def test_schedule_values_are_snapshotted_and_updates_apply_next_day(self):
+    def test_schedule_changes_update_active_day_immediately_without_rewriting_arrival(self):
         test_date = datetime(2026, 4, 15, 8, 0)
-        clock = [test_date]
-        with patch.object(system, "now_local", side_effect=lambda: clock[0]):
+        with patch.object(system, "now_local", return_value=test_date):
             csrf = self.sign_in()
-            first_dashboard = self.client.get("/api/admin/dashboard").get_json()
-            original = first_dashboard["schedule_state"]["active"]
+            original = self.client.get("/api/admin/dashboard").get_json()["schedule_state"]["active"]
             self.assertTrue(original["configured"])
-            self.assertEqual(original["date"], "2026-04-15")
             with system.app.app_context():
-                person_id = system.get_db().execute(
-                    "SELECT id FROM people WHERE kind='student' ORDER BY id LIMIT 1"
-                ).fetchone()["id"]
+                person_id = system.get_db().execute("SELECT id FROM people WHERE kind='student' ORDER BY id LIMIT 1").fetchone()["id"]
                 arrival = system.ensure_attendance(person_id, "arrival")
                 self.assertEqual(arrival["record"]["arrival_time"], "08:00:00")
-
-            changed = self.client.post(
-                "/api/admin/settings",
-                json={
-                    "attendance_start": "07:30",
-                    "attendance_cutoff": "08:10",
-                    "leaving_time": "15:30",
-                    "flexibility_minutes": 10,
-                    "minimum_early_leave_minutes": 25,
-                },
-                headers={"X-CSRFToken": csrf},
-            )
+            changed = self.client.post("/api/admin/settings", json={"attendance_start":"07:30", "attendance_cutoff":"08:10", "leaving_time":"15:30", "flexibility_minutes":10, "minimum_early_leave_minutes":25}, headers={"X-CSRFToken": csrf})
             self.assertEqual(changed.status_code, 200, changed.get_data(as_text=True))
-            state = changed.get_json()["schedule_state"]
-            self.assertEqual(state["active"], original)
-            self.assertTrue(state["has_pending_changes"])
-            self.assertEqual(state["pending_effective_date"], "2026-04-16")
+            payload = changed.get_json()
+            state = payload["schedule_state"]
+            self.assertTrue(payload["schedule_updated_today"])
+            self.assertFalse(state["has_pending_changes"])
+            self.assertEqual(state["active"]["attendance_start"], "07:30")
+            self.assertEqual(state["active"]["attendance_cutoff"], "08:10")
+            self.assertEqual(state["active"]["leaving_time"], "15:30")
             with system.app.app_context():
-                self.assertEqual(
-                    system.get_active_schedule()["attendance_start"],
-                    "08:00",
-                )
-                clock[0] = datetime(2026, 4, 15, 15, 0)
-                regular_departure = system.ensure_attendance(person_id, "departure")
+                self.assertEqual(system.get_active_schedule()["attendance_start"], "07:30")
+                saved_arrival = system.get_db().execute("SELECT arrival_time, attendance_status FROM attendance WHERE person_id=? AND attendance_date='2026-04-15'", (person_id,)).fetchone()
+                self.assertEqual(saved_arrival["arrival_time"], "08:00:00")
+                self.assertEqual(saved_arrival["attendance_status"], "Present")
+                with patch.object(system, "now_local", return_value=datetime(2026, 4, 15, 15, 30)):
+                    regular_departure = system.ensure_attendance(person_id, "departure")
                 self.assertEqual(regular_departure["record"]["departure_status"], "Left")
-                self.assertEqual(regular_departure["record"]["departure_time"], "15:00:00")
+                self.assertEqual(regular_departure["record"]["departure_time"], "15:30:00")
 
-        with patch.object(system, "now_local", return_value=datetime(2026, 4, 16, 7, 0)):
+    def test_schedule_changes_after_end_day_are_saved_for_next_day(self):
+        test_date = datetime(2026, 4, 15, 8, 0)
+        with patch.object(system, "now_local", return_value=test_date):
+            csrf = self.sign_in()
             with system.app.app_context():
-                next_day = system.get_active_schedule()
-                self.assertEqual(next_day["attendance_start"], "07:30")
-                self.assertEqual(next_day["minimum_early_leave_minutes"], "25")
-                self.assertEqual(next_day["date"], "2026-04-16")
-        with system.app.app_context():
-            historical = system.get_db().execute(
-                "SELECT schedule_json FROM schedule_snapshots WHERE attendance_date='2026-04-15'"
-            ).fetchone()
-            self.assertEqual(
-                system.json.loads(historical["schedule_json"])["attendance_start"],
-                "08:00",
-            )
+                system.get_db().execute("INSERT INTO attendance_days(attendance_date, finalized_at) VALUES (?, ?)", ("2026-04-15", system.stamp()))
+                system.get_db().commit()
+            changed = self.client.post("/api/admin/settings", json={"attendance_start":"07:30", "attendance_cutoff":"08:10", "leaving_time":"15:30", "flexibility_minutes":10, "minimum_early_leave_minutes":25}, headers={"X-CSRFToken": csrf})
+            self.assertEqual(changed.status_code, 200, changed.get_data(as_text=True))
+            payload = changed.get_json()
+            self.assertFalse(payload["schedule_updated_today"])
+            self.assertTrue(payload["schedule_state"]["has_pending_changes"])
+            self.assertEqual(payload["schedule_state"]["pending_effective_date"], "2026-04-16")
+            self.assertEqual(payload["schedule_state"]["active"]["attendance_start"], "08:00")
 
     def test_overnight_attendance_after_midnight_uses_shift_start_date(self):
         with system.app.app_context():
