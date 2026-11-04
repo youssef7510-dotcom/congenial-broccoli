@@ -125,6 +125,154 @@ class AttendanceSystemTests(unittest.TestCase):
             finalized = system.ensure_attendance(aisha_id, "arrival")
             self.assertIn("finalized", finalized["error"])
 
+    def test_end_to_end_arrival_early_leave_absence_and_excel_export(self):
+        admin_csrf = self.sign_in()
+        device_code = self.client.post(
+            "/api/admin/devices/code",
+            json={},
+            headers={"X-CSRFToken": admin_csrf},
+        ).get_json()["code"]
+        station_csrf = self.csrf("/")
+        paired = self.client.post(
+            "/api/pair",
+            json={"code": device_code, "device_name": "End-to-end test station"},
+            headers={"X-CSRFToken": station_csrf},
+        )
+        self.assertEqual(paired.status_code, 200, paired.get_data(as_text=True))
+
+        with system.app.app_context():
+            system.set_settings(
+                {
+                    "attendance_start": "08:00",
+                    "attendance_cutoff": "08:15",
+                    "leaving_time": "15:00",
+                    "flexibility_minutes": "5",
+                    "minimum_early_leave_minutes": "0",
+                }
+            )
+            db = system.get_db()
+            ids = {
+                row["name"]: row["id"]
+                for row in db.execute(
+                    "SELECT id, name FROM people WHERE kind='student' AND confirmed=1"
+                ).fetchall()
+            }
+            unused_code = db.execute(
+                "SELECT code FROM early_codes WHERE used_at IS NULL ORDER BY id LIMIT 1"
+            ).fetchone()["code"]
+
+        class FakeRecognizer:
+            def predict(self, _face):
+                return active_label[0], 10.0
+
+        active_label = [0]
+        labels = {0: ids["Aisha Rahman"], 1: ids["Maya Chen"]}
+        fake_image = system.np.zeros((200, 200), dtype=system.np.uint8)
+        current_time = [datetime(2026, 4, 15, 8, 0, 0)]
+        with (
+            patch.object(system, "now_local", side_effect=lambda: current_time[0]),
+            patch.object(system, "parse_image_data", return_value=fake_image),
+            patch.object(system, "extract_face", return_value=(fake_image, b"face")),
+            patch.object(
+                system,
+                "recognition_model",
+                return_value=(FakeRecognizer(), labels),
+            ),
+        ):
+            on_time = self.client.post(
+                "/api/recognize",
+                json={"image": "test-frame"},
+                headers={"X-CSRFToken": station_csrf},
+            )
+            self.assertEqual(on_time.status_code, 200, on_time.get_data(as_text=True))
+            on_time_data = on_time.get_json()
+            self.assertTrue(on_time_data["first_arrival"])
+            self.assertEqual(on_time_data["current_status"]["attendance"], "Present")
+            self.assertEqual(on_time_data["current_status"]["arrival_time"], "08:00:00")
+
+            active_label[0] = 1
+            current_time[0] = datetime(2026, 4, 15, 8, 20, 0)
+            late = self.client.post(
+                "/api/recognize",
+                json={"image": "test-frame"},
+                headers={"X-CSRFToken": station_csrf},
+            )
+            self.assertEqual(late.status_code, 200, late.get_data(as_text=True))
+            self.assertEqual(late.get_json()["current_status"]["attendance"], "Late")
+            self.assertEqual(late.get_json()["current_status"]["arrival_time"], "08:20:00")
+
+            active_label[0] = 0
+            current_time[0] = datetime(2026, 4, 15, 9, 0, 0)
+            confirmation = self.client.post(
+                "/api/recognize",
+                json={"image": "test-frame", "confirm_early_departure": True},
+                headers={"X-CSRFToken": station_csrf},
+            )
+            self.assertEqual(
+                confirmation.status_code, 200, confirmation.get_data(as_text=True)
+            )
+            ticket = confirmation.get_json()["ticket"]
+            self.assertTrue(ticket)
+
+            invalid_code = self.client.post(
+                "/api/attendance/early-leave",
+                json={"ticket": ticket, "code": "INVALID!", "reason": "Medical appointment"},
+                headers={"X-CSRFToken": station_csrf},
+            )
+            self.assertEqual(invalid_code.status_code, 400)
+            self.assertIn("invalid", invalid_code.get_json()["error"].lower())
+
+            early = self.client.post(
+                "/api/attendance/early-leave",
+                json={
+                    "ticket": ticket,
+                    "code": unused_code,
+                    "reason": "Medical appointment",
+                },
+                headers={"X-CSRFToken": station_csrf},
+            )
+            self.assertEqual(early.status_code, 200, early.get_data(as_text=True))
+            self.assertEqual(early.get_json()["record"]["departure_status"], "Left Early")
+            self.assertEqual(
+                early.get_json()["record"]["early_leave_reason"], "Medical appointment"
+            )
+            self.assertEqual(
+                early.get_json()["record"]["early_leave_code_result"], "valid"
+            )
+
+        current_time[0] = datetime(2026, 4, 15, 15, 5, 0)
+        ended = self.client.post(
+            "/api/admin/end-day",
+            json={"date": "2026-04-15"},
+            headers={"X-CSRFToken": admin_csrf},
+        )
+        self.assertEqual(ended.status_code, 200, ended.get_data(as_text=True))
+
+        report = self.client.get("/api/admin/report.xlsx?date=2026-04-15")
+        self.assertEqual(report.status_code, 200, report.get_data(as_text=True))
+        workbook = load_workbook(io.BytesIO(report.data), read_only=True)
+        aisha = next(
+            row for row in workbook["Grade 8"].iter_rows(min_row=2, values_only=True)
+            if row[1] == "Aisha Rahman"
+        )
+        maya = next(
+            row for row in workbook["Grade 9"].iter_rows(min_row=2, values_only=True)
+            if row[1] == "Maya Chen"
+        )
+        omar = next(
+            row for row in workbook["Grade 8"].iter_rows(min_row=2, values_only=True)
+            if row[1] == "Omar Hassan"
+        )
+        self.assertEqual(aisha[4], "Present")
+        self.assertEqual(aisha[6], "Left Early")
+        self.assertEqual(aisha[7], "09:00:00")
+        self.assertEqual(aisha[8], "Medical appointment")
+        self.assertEqual(maya[4], "Late")
+        self.assertEqual(maya[5], "08:20:00")
+        self.assertEqual(omar[4], "Absent")
+        self.assertIsNone(omar[5])
+        workbook.close()
+
     def test_device_code_is_single_use_and_pairing_is_persistent(self):
         csrf = self.sign_in()
         response = self.client.post(
